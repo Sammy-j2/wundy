@@ -1,3 +1,36 @@
+"""First-order 1D finite element solver utilities.
+
+This module provides a minimal linear 1D finite element assembly and solver
+for two-node (linear) bar elements. It supports assembling the global
+stiffness matrix, applying Neumann (point) loads, applying distributed
+loads (types "BX" and "GRAV"), and eliminating Dirichlet (prescribed)
+degrees of freedom via a symmetry-preserving elimination.
+
+Key functions
+- ``first_fe_code``: assemble and solve a 1D linear finite element problem.
+- ``global_dof``: compute the global degree-of-freedom index for a node.
+
+Data shapes and conventions
+- ``coords``: numpy array of shape (num_nodes, ndim) where ndim == 1 for
+    this solver (but stored as Nx1 arrays in the project). Node indices are
+    assumed zero-based.
+- ``blocks``: list of element blocks; each block contains element
+    connectivity under the key ``connect`` and element properties under
+    ``element`` -> ``properties``.
+- ``bcs``: list of boundary condition dicts with types defined in
+    ``wundy.schemas`` (``DIRICHLET`` and ``NEUMANN``).
+- ``dloads``: list of distributed-load dicts; supported ``type`` values in
+    this module are ``"BX"`` (body/axial load per unit length) and
+    ``"GRAV"`` (gravity, requires material density).
+
+Raises
+- ``ValueError`` for zero-length elements or invalid distributed-load
+    directions.
+- ``NotImplementedError`` for unsupported distributed-load types.
+
+Note: this file focuses on clarity and testability rather than performance.
+"""
+
 from typing import Any
 
 import numpy as np
@@ -15,6 +48,47 @@ def first_fe_code(
     materials: dict[str, Any],
     block_elem_map: dict[int, tuple[int, int]],
 ) -> dict[str, Any]:
+    """Assemble and solve a 1D linear finite element problem.
+
+    Parameters
+    ----------
+    coords:
+        Array of nodal coordinates (shape: (num_nodes, ndim)). Node indices
+        are assumed zero-based.
+    blocks:
+        List of element blocks. Each block must include an ``element``
+        mapping with ``properties`` (e.g. ``area``) and a ``connect`` list
+        of node index pairs for each element.
+    bcs:
+        List of boundary condition dicts. Use values from
+        ``wundy.schemas`` for ``DIRICHLET`` and ``NEUMANN`` types.
+    dloads:
+        List of distributed load dicts. Supported types: ``"BX"`` and
+        ``"GRAV"`` (requires material ``density``).
+    materials:
+        Mapping of material name to material definition (parameters,
+        density, etc.).
+    block_elem_map:
+        Mapping from global element id to a tuple ``(block_index,
+        local_element_index)`` used to locate element connectivity for
+        distributed loads.
+
+    Returns
+    -------
+    dict
+        A solution dictionary with keys:
+        - ``dofs``: numpy array of nodal degrees of freedom (displacements).
+        - ``stiff``: assembled global stiffness matrix K.
+        - ``force``: global force vector F (before Dirichlet elimination).
+
+    Raises
+    ------
+    ValueError
+        On zero-length elements or invalid distributed-load directions.
+    NotImplementedError
+        If an unsupported distributed-load ``type`` is encountered.
+
+    """
     dof_per_node = 1
     num_node = coords.shape[0]
     num_dof = num_node * dof_per_node
