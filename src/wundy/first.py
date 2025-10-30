@@ -1,36 +1,3 @@
-"""First-order 1D finite element solver utilities.
-
-This module provides a minimal linear 1D finite element assembly and solver
-for two-node (linear) bar elements. It supports assembling the global
-stiffness matrix, applying Neumann (point) loads, applying distributed
-loads (types "BX" and "GRAV"), and eliminating Dirichlet (prescribed)
-degrees of freedom via a symmetry-preserving elimination.
-
-Key functions
-- ``first_fe_code``: assemble and solve a 1D linear finite element problem.
-- ``global_dof``: compute the global degree-of-freedom index for a node.
-
-Data shapes and conventions
-- ``coords``: numpy array of shape (num_nodes, ndim) where ndim == 1 for
-    this solver (but stored as Nx1 arrays in the project). Node indices are
-    assumed zero-based.
-- ``blocks``: list of element blocks; each block contains element
-    connectivity under the key ``connect`` and element properties under
-    ``element`` -> ``properties``.
-- ``bcs``: list of boundary condition dicts with types defined in
-    ``wundy.schemas`` (``DIRICHLET`` and ``NEUMANN``).
-- ``dloads``: list of distributed-load dicts; supported ``type`` values in
-    this module are ``"BX"`` (body/axial load per unit length) and
-    ``"GRAV"`` (gravity, requires material density).
-
-Raises
-- ``ValueError`` for zero-length elements or invalid distributed-load
-    directions.
-- ``NotImplementedError`` for unsupported distributed-load types.
-
-Note: this file focuses on clarity and testability rather than performance.
-"""
-
 from typing import Any
 
 import numpy as np
@@ -48,47 +15,111 @@ def first_fe_code(
     materials: dict[str, Any],
     block_elem_map: dict[int, tuple[int, int]],
 ) -> dict[str, Any]:
-    """Assemble and solve a 1D linear finite element problem.
+    """
+    Assemble and solve a 1D linear finite element (FE) problem for axial deformation.
+
+    This function performs the full finite element procedure for a 1D bar under
+    axial loading. It assembles the global stiffness matrix `K` and force vector `F`
+    from element, boundary condition, and material definitions, then applies both
+    Neumann (traction/force) and Dirichlet (displacement) boundary conditions.
+    The system of equations
+
+        K * u = F
+
+    is solved for the nodal displacements `u` using static condensation of prescribed
+    degrees of freedom. The final nodal displacements, stiffness matrix, and force
+    vector are returned.
 
     Parameters
     ----------
-    coords:
-        Array of nodal coordinates (shape: (num_nodes, ndim)). Node indices
-        are assumed zero-based.
-    blocks:
-        List of element blocks. Each block must include an ``element``
-        mapping with ``properties`` (e.g. ``area``) and a ``connect`` list
-        of node index pairs for each element.
-    bcs:
-        List of boundary condition dicts. Use values from
-        ``wundy.schemas`` for ``DIRICHLET`` and ``NEUMANN`` types.
-    dloads:
-        List of distributed load dicts. Supported types: ``"BX"`` and
-        ``"GRAV"`` (requires material ``density``).
-    materials:
-        Mapping of material name to material definition (parameters,
-        density, etc.).
-    block_elem_map:
-        Mapping from global element id to a tuple ``(block_index,
-        local_element_index)`` used to locate element connectivity for
-        distributed loads.
+    coords : (num_nodes, 1) NDArray[float]
+        Array of nodal coordinates along the 1D domain.
+        Each row corresponds to the x-position of a node.
+    blocks : list of dict
+        Element block definitions. Each block contains:
+            - "element": dict with "properties" → {"area": float}
+            - "material": str name corresponding to `materials` entry
+            - "connect": list of tuples, each containing the node indices
+              (start, end) defining each element.
+    bcs : list of dict
+        Boundary condition definitions. Each dictionary includes:
+            - "type": either `DIRICHLET` or `NEUMANN`
+            - "nodes": list of node indices
+            - "local_dof": integer (typically 0 for 1D problems)
+            - "value": prescribed displacement (Dirichlet) or force (Neumann)
+    dloads : list of dict
+        Distributed load definitions. Each dictionary includes:
+            - "type": "BX" for uniform body load, or "GRAV" for gravity-based load
+            - "direction": array-like of length 1 indicating load direction (+1 or −1)
+            - "value": load magnitude
+            - "elements": list of element IDs the load applies to
+            - "name": descriptive string used for error reporting
+    materials : dict[str, Any]
+        Material database mapping material names to property dictionaries.
+        Each material must define:
+            - "parameters": {"E": float}  (Young’s modulus)
+            - "density": float (only needed for gravity-type distributed loads)
+    block_elem_map : dict[int, tuple[int, int]]
+        Maps global element IDs (used in `dloads`) to the tuple
+        (block_index, local_element_index_within_block).
 
     Returns
     -------
-    dict
-        A solution dictionary with keys:
-        - ``dofs``: numpy array of nodal degrees of freedom (displacements).
-        - ``stiff``: assembled global stiffness matrix K.
-        - ``force``: global force vector F (before Dirichlet elimination).
+    solution : dict[str, Any]
+        Dictionary containing:
+            - "dofs" : NDArray[float]
+                Solved global nodal displacement vector.
+            - "stiff" : NDArray[float]
+                Assembled global stiffness matrix.
+            - "force" : NDArray[float]
+                Assembled global force vector (after loads and BCs applied).
 
     Raises
     ------
     ValueError
-        On zero-length elements or invalid distributed-load directions.
+        If element length is zero, a distributed load references an unknown
+        element, or load direction is invalid.
     NotImplementedError
-        If an unsupported distributed-load ``type`` is encountered.
+        If a distributed load type is not supported (only "BX" and "GRAV" are allowed).
 
+    Notes
+    -----
+    Each 1D bar element contributes the local stiffness matrix
+
+        ke = (A * E / L) * [[ 1, -1 ],
+                            [ -1,  1 ]]
+
+    and, for distributed loads `q`, the equivalent nodal force vector
+
+        fe = q * L / 2 * [1, 1]^T.
+
+    Dirichlet boundary conditions are applied via partitioning:
+    free and prescribed DOFs are separated, and the reduced system is solved as
+
+        K_ff * u_f = F_f - K_fp * u_p
+
+    before back-substituting to obtain the complete displacement field.
+
+    Examples
+    --------
+    >>> coords = np.array([[0.0], [1.0]])
+    >>> blocks = [{
+    ...     "element": {"properties": {"area": 1.0}},
+    ...     "material": "steel",
+    ...     "connect": [(0, 1)]
+    ... }]
+    >>> materials = {"steel": {"parameters": {"E": 210e9}, "density": 7850.0}}
+    >>> bcs = [
+    ...     {"type": DIRICHLET, "nodes": [0], "local_dof": 0, "value": 0.0},
+    ...     {"type": NEUMANN, "nodes": [1], "local_dof": 0, "value": 1000.0},
+    ... ]
+    >>> dloads = []
+    >>> block_elem_map = {0: (0, 0)}
+    >>> result = first_fe_code(coords, blocks, bcs, dloads, materials, block_elem_map)
+    >>> result["dofs"]
+    array([0.0, 4.7619e-06])  # approximate
     """
+
     dof_per_node = 1
     num_node = coords.shape[0]
     num_dof = num_node * dof_per_node
@@ -194,6 +225,65 @@ def global_dof(node: int, local_dof: int, dof_per_node: int) -> int:
     """Return the global degree of freedom index for a given node and local dof
 
     NOTE: Assumes elements have uniform degrees of freedom across the mesh.
+
+    Compute the global degree of freedom (DOF) index for a given node and local DOF.
+
+    This helper function maps a local degree of freedom at a specific node
+    to its corresponding global index in the assembled finite element system.
+    The mapping assumes that each node has the same number of DOFs
+    (`dof_per_node`) throughout the mesh. It is typically used during
+    assembly of the global stiffness matrix and force vector.
+
+    Parameters
+    ----------
+    node : int
+        The node index (0-based) for which the global DOF index is desired.
+
+    local_dof : int
+        The local degree of freedom number at the given node.
+        For 1D elements, this is almost always 0.
+
+    dof_per_node : int
+        Number of degrees of freedom associated with each node.
+        For a simple 1D axial bar or truss problem, this value is 1.
+
+    Returns
+    -------
+    global_index : int
+        The global DOF index corresponding to the specified node and local DOF.
+
+    Notes
+    -----
+    The relationship between local and global DOFs is defined as
+
+    .. math::
+        \text{global\_dof} = \text{node} \times \text{dof\_per\_node} + \text{local\_dof}
+
+    This formula ensures unique indexing for all nodal DOFs in the mesh.
+
+    Examples
+    --------
+    For a system with one DOF per node (e.g., 1D axial deformation):
+
+    >>> global_dof(0, 0, 1)
+    0
+    >>> global_dof(1, 0, 1)
+    1
+
+    For a 2D problem with 2 DOFs per node (u_x, u_y):
+
+    >>> global_dof(0, 0, 2)
+    0  # x-displacement at node 0
+    >>> global_dof(0, 1, 2)
+    1  # y-displacement at node 0
+    >>> global_dof(1, 0, 2)
+    2  # x-displacement at node 1
+    >>> global_dof(1, 1, 2)
+    3  # y-displacement at node 1
+
+    See Also
+    --------
+    first_fe_code : Uses this function to assemble global stiffness and force matrices.
 
     """
     return node * dof_per_node + local_dof
