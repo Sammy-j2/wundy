@@ -1,18 +1,44 @@
 import logging
-from typing import IO
-from typing import Any
+import re
+from typing import Any, IO
 
 import numpy as np
 import yaml
 
-from .schemas import NEUMANN
-from .schemas import input_schema
+from .schemas import NEUMANN, input_schema
 
 logger = logging.getLogger(__name__)
 
 
 def load(file: IO[Any]) -> dict[str, dict[str, Any]]:
-    data = yaml.safe_load(file)
+    """Load YAML from a file-like object, coerce numeric-like strings, then validate.
+
+    Some YAML parsers or editor workflows may leave numeric-looking tokens as
+    strings (e.g. "2.1e11"). To be forgiving, coerce any material parameters
+    that look like floats into actual floats before schema validation.
+    """
+    text = file.read()
+    data = yaml.safe_load(text)
+
+    # Coerce numeric-looking strings in material parameters to floats so the
+    # schema's numeric checks succeed even if PyYAML returned strings.
+    float_re = re.compile(r"^[+-]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?$")
+    try:
+        mats = data.get("wundy", {}).get("materials", [])
+        for m in mats:
+            params = m.get("parameters", {})
+            for k, v in list(params.items()):
+                if isinstance(v, str) and float_re.match(v.strip()):
+                    try:
+                        params[k] = float(v)
+                    except Exception:
+                        # leave as-is if conversion fails
+                        pass
+    except Exception:
+        # be conservative: if data shape unexpected, skip coercion and let
+        # schema validation handle errors
+        pass
+
     return input_schema.validate(data)
 
 
@@ -59,7 +85,13 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
     num_elem: int = len(inp["elements"])
     elem_map: dict[int, int] = preprocessed.setdefault("elem_map", {})
+    # Elements expected format: [eid, n1, n2, ...]. Validate shape early so
+    # downstream code (assembly/first_fe_code) does not hit obscure IndexErrors.
     for i, element in enumerate(inp["elements"]):
+        if not isinstance(element, list) or len(element) < 3:
+            raise ValueError(
+                "Each element entry must be a list: [elem_id, node1, node2, ...] with at least two nodes"
+            )
         elem_map[element[0]] = i
 
     # Put node sets in dictionary for easier look up

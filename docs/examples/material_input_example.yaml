@@ -1,0 +1,46 @@
+wundy:
+  nodes:
+    - [1, 0.0]
+    - [2, 1.0]
+
+  elements:
+    - [1, 1, 2]
+
+  materials:
+    - type: elastic
+      name: steel_a
+      parameters:
+        E: 2.1e11
+        nu: 0.3
+      density: 7850.0
+
+    - type: elastic
+      name: aluminum
+      parameters:
+        E: 7.0e10
+        nu: 0.33
+      density: 2700.0
+
+  element blocks:
+    - name: left_block
+      material: steel_a
+      elements: [1]
+      element:
+        type: T1D1
+        properties:
+          area: 1.0
+
+  boundary conditions:
+    - nodes: [1]
+      dof: X
+      type: DIRICHLET
+      value: 0.0
+
+  concentrated loads:
+    - nodes: [2]
+      dof: X
+      value: 1000.0
+
+# Minimal example showing two materials (steel and aluminum) and one
+# bar element. Use `wundy.ui.load` and `wundy.ui.preprocess` to convert
+# this YAML into the structures accepted by `first.first_fe_code()`.
