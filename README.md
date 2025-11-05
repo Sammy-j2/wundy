@@ -1,5 +1,5 @@
 # wundy
-One dimension finite element program for my theroy of FEM course
+One dimension finite element program for my theory of FEM course
 
 ## Install
 
