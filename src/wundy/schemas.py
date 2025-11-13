@@ -91,8 +91,22 @@ def validate_material_parameters(material: dict[str, dict[str, Any]]) -> bool:
             "nu": And(isnumeric, lambda x: -1.0 <= x < 0.5, error="nu must be between -1 and .5"),
         }
     )
-    if normalize_case(material["type"]) == "ELASTIC":
+    # Support for Neo-Hookean materials: accept either the same E/nu pair
+    # or Lame/mu style parameters (mu and lambda). The solver currently
+    # linearizes Neo-Hookean materials using an equivalent Young's modulus
+    # for assembly, so we allow both forms for user convenience.
+    mt = normalize_case(material["type"])
+    if mt == "ELASTIC":
         elastic.validate(material["parameters"])
+    elif "NEO" in mt and "HOOK" in mt:
+        # Neo-Hookean can be specified either as (E, nu) or (mu, lambda)
+        neo_lame = Schema({"mu": And(isnumeric, ispositive), "lambda": And(isnumeric)})
+        try:
+            # Prefer E/nu if provided
+            elastic.validate(material["parameters"])
+        except Exception:
+            # Fall back to mu/lambda
+            neo_lame.validate(material["parameters"])
     else:
         raise ValueError(f"Unknown material {material['type']!r}")
     return True

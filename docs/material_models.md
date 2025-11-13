@@ -54,6 +54,27 @@ Notes:
   used by the 1‑D constitutive helper (it is ignored unless you extend
   `material_constitutive` for higher dimensions).
 
+### Neo‑Hookean example
+
+You can also specify compressible Neo‑Hookean materials. The loader accepts
+either the classic `(E, nu)` pair or Lame-style parameters `(mu, lambda)` or
+`(mu, kappa)`. The nonlinear solver path will be used when a material type
+containing `neo` and `hook` is detected (case-insensitive).
+
+```yaml
+materials:
+  - type: neo_hooke
+    name: rubber
+    parameters:
+      mu: 3.0e5
+      lambda: 2.0e5
+    density: 1200.0
+```
+
+When using Neo‑Hookean materials the solver performs a Newton–Raphson
+iteration with a consistent 1‑D tangent and returns the nonlinear nodal
+displacements. See the examples directory for a runnable input file.
+
 ## Programmatic (Python) example
 
 You can provide the same data directly to `first_fe_code` as a Python

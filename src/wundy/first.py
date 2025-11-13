@@ -116,11 +116,30 @@ def first_fe_code(
     ... ]
     >>> dloads = []
     >>> block_elem_map = {0: (0, 0)}
-    >>> result = first_fe_code(coords, blocks, bcs, dloads, materials, block_elem_map)
-    >>> result["dofs"]
-    array([0.0, 4.7619e-06])  # approximate
-    """
+        >>> result = first_fe_code(coords, blocks, bcs, dloads, materials, block_elem_map)
+        >>> result["dofs"]
+        array([0.0, 4.7619e-06])  # approximate
 
+        Additional notes about nonlinear materials
+        -----------------------------------------
+
+        If any material in the `materials` database has a type containing both
+        the tokens `neo` and `hook` (case-insensitive, underscores or hyphens
+        allowed), the solver will switch to a nonlinear Newton–Raphson solution
+        path for the whole problem. In that case:
+
+        - Element internal forces are formed using a 1‑D compressible
+            Neo‑Hookean model and a consistent tangent (see `_neo_PK1_and_tangent`).
+        - The Newton iteration uses a default residual tolerance of 1e-8 and a
+            maximum of 25 iterations. If Newton fails to converge the solver
+            raises a RuntimeError describing the final residual.
+
+        At present the nonlinear path is automatic and uses the material
+        parameters supplied in the YAML (either E/nu or mu/lambda/mu/kappa).
+        Future releases may expose NR controls (tolerance, max iterations)
+        as explicit API arguments.
+
+        """
     dof_per_node = 1
     num_node = coords.shape[0]
     num_dof = num_node * dof_per_node
@@ -132,6 +151,97 @@ def first_fe_code(
         integration = {"stiffness": "analytic", "internal": "analytic", "ngp": 2}
     ngp = int(integration.get("ngp", 2))
 
+    # Decide whether a nonlinear (Neo-Hookean) solution is required.
+    def is_neo_material(m: dict[str, Any]) -> bool:
+        t = str(m.get("type", "")).upper()
+        tn = t.replace("-", "").replace("_", "")
+        return "NEO" in tn and "HOOK" in tn
+
+    nonlinear = any(is_neo_material(mat) for mat in materials.values())
+
+    # If nonlinear materials are present, solve using Newton-Raphson with
+    # consistent tangent stiffness per element (1D compressible Neo-Hookean).
+    if nonlinear:
+        # Build constant external force vector (Neumann + dloads) and prescribed lists
+        F_ext, prescribed_dofs, prescribed_vals = assemble_external_forces(
+            coords, blocks, bcs, dloads, materials, block_elem_map, dof_per_node
+        )
+
+        # Initialize displacement vector (prescribed DOFs set to prescribed_vals)
+        u = np.zeros(num_dof, dtype=float)
+        for pd, pv in zip(prescribed_dofs, prescribed_vals):
+            u[pd] = pv
+
+        # Newton-Raphson iterations
+        tol = 1e-8
+        max_it = 25
+        for it in range(max_it):
+            # Reset global tangent and internal force
+            K[:, :] = 0.0
+            F_int = np.zeros_like(F_ext)
+
+            # Assemble internal forces and tangent stiffness
+            for block in blocks:
+                A = block["element"]["properties"]["area"]
+                mat = materials[block["material"]]
+                for nodes in block["connect"]:
+                    eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
+                    xe = coords[nodes]
+                    he = xe[1, 0] - xe[0, 0]
+                    if np.isclose(he, 0.0):
+                        raise ValueError(f"Zero-length element detected between nodes {nodes}")
+
+                    # Element nodal displacements in current configuration
+                    ue = u[eft]
+                    u1, u2 = float(ue[0]), float(ue[1])
+                    # Deformation gradient for 1D element (constant over element)
+                    F_e = 1.0 + (u2 - u1) / float(he)
+
+                    # Compute first Piola-Kirchhoff stress P and its derivative dP/dF
+                    if is_neo_material(mat):
+                        P, dPdF = _neo_PK1_and_tangent(mat, F_e)
+                    else:
+                        # Material is linear elastic; use P = E*(F-1), dP/dF = E
+                        E = material_tangent_modulus(mat)
+                        P = E * (F_e - 1.0)
+                        dPdF = float(E)
+
+                    # Element internal nodal force (reference configuration)
+                    fe_int = A * P * np.array([-1.0, 1.0], dtype=float)
+                    F_int[eft] += fe_int
+
+                    # Consistent element tangent: ke = A * dP/dF / L * [[1,-1],[-1,1]]
+                    ke = (A * dPdF / float(he)) * np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
+                    K[np.ix_(eft, eft)] += ke
+
+            # Residual
+            R = F_ext - F_int
+
+            # Restrict to free DOFs and solve for increment
+            all_dofs = np.arange(num_dof)
+            free_dofs = np.setdiff1d(all_dofs, prescribed_dofs)
+            Kff = K[np.ix_(free_dofs, free_dofs)]
+            Rf = R[free_dofs]
+
+            # Solve linear system for delta on free DOFs
+            try:
+                du_f = np.linalg.solve(Kff, Rf)
+            except np.linalg.LinAlgError as exc:
+                raise np.linalg.LinAlgError(f"Tangent stiffness singular at iteration {it}") from exc
+
+            # Update solution
+            u[free_dofs] += du_f
+
+            # Convergence check (residual norm)
+            rnorm = np.linalg.norm(Rf)
+            if rnorm < tol:
+                solution = {"dofs": u, "stiff": K, "force": F_ext}
+                return solution
+
+        # If we get here, NR did not converge
+        raise RuntimeError(f"Newton-Raphson did not converge after {max_it} iterations; residual={rnorm}")
+
+    # Nonlinear not requested: previous linear assembly path
     # Assemble global stiffness
     for block in blocks:
         A = block["element"]["properties"]["area"]
@@ -624,9 +734,47 @@ def material_tangent_modulus(material: dict) -> float:
     ValueError
         If the material dictionary does not contain the expected key.
     """
+    # Allow different material types (ELASTIC, NEO-HOOKE). For Neo-Hookean
+    # materials we accept either an (E, nu) pair or Lame parameters (mu, lambda)
+    # and compute an equivalent Young's modulus for assembly (linearized).
+    params = material.get("parameters", {})
+    mtype = str(material.get("type", "ELASTIC")).upper()
+    # normalize variants like NEO_HOOKE or NEO-HOOKE
+    mtype_norm = mtype.replace("-", "").replace("_", "")
+    if mtype_norm == "ELASTIC":
+        try:
+            E = params["E"]
+        except Exception as exc:
+            raise ValueError("Material definition must include parameters['E'] for ELASTIC") from exc
+        return float(E)
+    if "NEO" in mtype_norm and "HOOK" in mtype_norm:
+        # If user provided E, use it. Otherwise, compute E from mu and lambda.
+        if "E" in params:
+            return float(params["E"])
+        if "mu" in params and "lambda" in params:
+            mu = float(params["mu"])
+            lam = float(params["lambda"])
+            # Convert Lame parameters to Young's modulus E:
+            # E = mu*(3*lambda + 2*mu)/(lambda + mu)
+            if (lam + mu) == 0:
+                raise ValueError("Invalid Lame parameters: lambda + mu must be non-zero")
+            E = mu * (3.0 * lam + 2.0 * mu) / (lam + mu)
+            return float(E)
+        if "mu" in params and "kappa" in params:
+            mu = float(params["mu"])
+            kappa = float(params["kappa"])
+            lam = kappa - 2.0 / 3.0 * mu
+            if (lam + mu) == 0:
+                raise ValueError("Invalid parameters: computed lambda + mu is zero")
+            E = mu * (3.0 * lam + 2.0 * mu) / (lam + mu)
+            return float(E)
+        raise ValueError(
+            "Neo-Hookean material requires either parameters['E'] or parameters['mu'] and parameters['lambda']"
+        )
+    # Fallback: try to read E and raise a helpful error if missing
     try:
-        E = material["parameters"]["E"]
-    except Exception as exc:  # KeyError / TypeError
+        E = params["E"]
+    except Exception as exc:
         raise ValueError("Material definition must include parameters['E']") from exc
     return float(E)
 
@@ -642,6 +790,54 @@ def material_constitutive(material: dict, ndim: int = 1) -> np.ndarray:
     if ndim == 1:
         return np.array([[E]], dtype=float)
     raise NotImplementedError("material_constitutive currently supports ndim==1 only")
+
+
+def _neo_PK1_and_tangent(material: dict, F: float) -> tuple[float, float]:
+    """Return first Piola-Kirchhoff stress P and tangent dP/dF for 1D
+
+    Uses a compressible Neo-Hookean energy reduced to 1D:
+
+        W = (mu/2)*(F**2 - 3) - mu*ln(F) + (kappa/2)*(ln(F))**2
+
+    so that
+
+        P = dW/dF = mu*(F - 1/F) + (kappa*ln(F))/F
+
+    and
+
+        dP/dF = mu*(1 + 1/F^2) + kappa*(1 - ln(F))/F^2
+
+    The function accepts materials specified either by (E, nu) or (mu, lambda)
+    (or mu and kappa). If E/nu are provided they are converted to mu/kappa.
+    """
+    if F <= 0.0:
+        raise ValueError("Invalid deformation gradient F <= 0 for Neo-Hookean material")
+
+    params = material.get("parameters", {})
+    # Determine mu and kappa (bulk modulus)
+    if "mu" in params and "lambda" in params:
+        mu = float(params["mu"])
+        lam = float(params["lambda"])
+        # convert to bulk modulus
+        kappa = lam + 2.0 / 3.0 * mu
+    elif "mu" in params and "kappa" in params:
+        mu = float(params["mu"])
+        kappa = float(params["kappa"])
+    elif "E" in params and "nu" in params:
+        E = float(params["E"])
+        nu = float(params["nu"])
+        mu = E / (2.0 * (1.0 + nu))
+        kappa = E / (3.0 * (1.0 - 2.0 * nu))
+    else:
+        raise ValueError(
+            "Neo-Hookean material requires either (E,nu) or (mu,lambda) or (mu,kappa) in parameters"
+        )
+
+    # compute P and dP/dF
+    lnF = float(np.log(F))
+    P = mu * (F - 1.0 / F) + (kappa * lnF) / F
+    dPdF = mu * (1.0 + 1.0 / (F * F)) + kappa * (1.0 - lnF) / (F * F)
+    return float(P), float(dPdF)
 
 
 def element_strain(length: float, ue: np.ndarray) -> float:

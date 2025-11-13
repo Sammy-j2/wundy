@@ -21,6 +21,13 @@ wundy:
         nu: 0.33
       density: 2700.0
 
+    - type: neo_hooke
+      name: rubber
+      parameters:
+        mu: 3.0e5
+        lambda: 2.0e5
+      density: 1200.0
+
   element blocks:
     - name: left_block
       material: steel_a
