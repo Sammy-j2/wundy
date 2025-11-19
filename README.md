@@ -76,3 +76,32 @@ PY
 
 Alternatively, copy the snippet into a small script (for example
 `bin/run_example.py`) and run it with `python bin/run_example.py`.
+
+## Example: multi-DOF input
+
+An example showing `dof_per_node: 2` and how to specify `X`/`Y` DOFs is
+included at `docs/examples/multidof_example.yaml`. This demonstrates the
+preprocessor mapping of symbolic DOF names to local indices and the
+axial-only assembly behaviour documented in `docs/material_models.md`.
+
+To run the multi-DOF example:
+
+```powershell
+# activate venv (PowerShell)
+.\.venvwundy\Scripts\Activate.ps1
+
+python - <<'PY'
+from pathlib import Path
+from wundy import ui, first
+
+p = Path('docs/examples/multidof_example.yaml')
+with p.open() as fh:
+	data = ui.load(fh)
+inp = ui.preprocess(data)
+sol = first.first_fe_code(
+	inp['coords'], inp['blocks'], inp['bcs'], inp['dload'], inp['materials'], inp['block_elem_map'], dof_per_node=inp['dof_per_node']
+)
+print('dofs:', sol['dofs'])
+print('residual:', sol['residual'])
+PY
+```

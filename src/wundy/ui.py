@@ -10,6 +10,31 @@ from .schemas import NEUMANN, input_schema
 logger = logging.getLogger(__name__)
 
 
+"""YAML loader and preprocessor for wundy.
+
+This module exposes two user-facing helpers:
+
+- `load(file)`: read YAML from a file-like object, coerce some common
+    numeric-looking string tokens into numbers, and validate against the
+    input schema defined in `src/wundy/schemas.py`.
+- `preprocess(data)`: transform the validated YAML into the compact
+    Python structures used by the assembler/solver (`coords`, `blocks`,
+    `bcs`, `dload`, `materials`, `block_elem_map`, etc.).
+
+The preprocessor also handles these important behaviors:
+
+- `dof_per_node`: reads the user-requested number of DOFs per node and
+    stores it in the preprocessed output. This enables the solver's
+    uniform multi-DOF mode where the axial element is expanded into a
+    `2 * dof_per_node` sized element contribution (axial DOF is local
+    index 0).
+- Integration options: global integration defaults are merged with any
+    user-provided global `integration` block and with per-element-block
+    `integration` overrides. The resulting dict is stored on each block as
+    `block['integration']` for use during assembly.
+"""
+
+
 def load(file: IO[Any]) -> dict[str, dict[str, Any]]:
     """Load YAML from a file-like object, coerce numeric-like strings, then validate.
 
@@ -83,6 +108,17 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         node_map[nid] = i
         coords[i, : len(xc)] = xc
 
+    # Degrees of freedom per node: allow user to request 1/2/3 DOFs per node
+    try:
+        dof_per_node = int(inp.get("dof_per_node", 1))
+    except Exception:
+        dof_per_node = 1
+    preprocessed["dof_per_node"] = dof_per_node
+    # Note: `dof_per_node` influences validation of BC/load local DOF
+    # indices later in this function. The solver assumes the axial DOF is
+    # the local index 0 for each node when expanding element contributions
+    # to the multi-DOF element vector/matrix.
+
     num_elem: int = len(inp["elements"])
     elem_map: dict[int, int] = preprocessed.setdefault("elem_map", {})
     # Elements expected format: [eid, n1, n2, ...]. Validate shape early so
@@ -139,6 +175,23 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
             logger.error(f"Duplicate material {name!r}")
         else:
             materials[name] = {"type": material["type"], "parameters": material["parameters"]}
+    
+        # Integration options: global defaults merged with user-provided top-level settings
+        default_integration = {
+            "stiffness": "analytic",
+            "internal": "analytic",
+            "ngp": 2,
+            "nonlinear": "linearize",
+        }
+        user_integration = inp.get("integration") or {}
+        # ensure ngp is an int when supplied as string
+        try:
+            if isinstance(user_integration.get("ngp", None), str):
+                user_integration["ngp"] = int(user_integration["ngp"])
+        except Exception:
+            pass
+        global_integration = {**default_integration, **user_integration}
+        preprocessed["integration"] = global_integration
 
     # Put element blocks in dictionary for easier look up
     blocks: list[Any] = preprocessed.setdefault("blocks", [])
@@ -202,6 +255,14 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
                 connect.append(row)
             else:
                 block["connect"] = np.array(connect, dtype=int)
+                # Merge per-block integration options with global defaults
+                block_user_integ = eb.get("integration") or {}
+                try:
+                    if isinstance(block_user_integ.get("ngp", None), str):
+                        block_user_integ["ngp"] = int(block_user_integ["ngp"])
+                except Exception:
+                    pass
+                block["integration"] = {**preprocessed.get("integration", {}), **block_user_integ}
                 # Map from global index to local index
                 block["elem_map"] = dict(zip(elems, range(len(elems))))
                 blocks.append(block)
@@ -232,10 +293,20 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
                     )
                 else:
                     nodes.append(node_map[n])
+        # Validate requested local_dof against configured dof_per_node. The
+        # input schema converts symbolic DOF names like 'X'/'Y' to numeric
+        # local indices; here we ensure the index is within the declared
+        # range [0, dof_per_node).
+        local_dof = bc["dof"]
+        if not (0 <= int(local_dof) < preprocessed["dof_per_node"]):
+            errors += 1
+            logger.error(
+                f"Boundary condition {name} requests local DOF {local_dof}, but dof_per_node={preprocessed['dof_per_node']}"
+            )
         boundary.append(
             {
                 "name": name,
-                "local_dof": bc["dof"],
+                "local_dof": int(local_dof),
                 "type": bc["type"],
                 "nodes": nodes,
                 "value": bc["value"],
@@ -265,10 +336,16 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
                     logger.error(f"Node {n}, required by concentrated load {i + 1}, is not defined")
                 else:
                     nodes.append(node_map[n])
+        local_dof = cl["dof"]
+        if not (0 <= int(local_dof) < preprocessed["dof_per_node"]):
+            errors += 1
+            logger.error(
+                f"Concentrated load {name} requests local DOF {local_dof}, but dof_per_node={preprocessed['dof_per_node']}"
+            )
         boundary.append(
             {
                 "name": name,
-                "local_dof": cl["dof"],
+                "local_dof": int(local_dof),
                 "type": NEUMANN,
                 "nodes": nodes,
                 "value": cl["value"],

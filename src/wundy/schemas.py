@@ -1,3 +1,17 @@
+"""Input schema definitions and helper enums for wundy YAML inputs.
+
+This module centralizes input validation and small helper functions for
+mapping user-friendly tokens (like `X`, `Y`, `Z` for DOFs) into the
+integers and structures expected by the assembler and solver code.
+
+Important conventions:
+- `dof` tokens in YAML may be given as letters (`X`, `Y`, `Z`) and are
+    converted to numeric local DOF indices by `dof_id_to_enum` for use
+    during preprocessing/assembly.
+- `integration_schema` defines allowed integration-related options and is
+    merged between global and per-block settings by the preprocessor.
+"""
+
 from typing import Any
 
 from schema import And
@@ -53,6 +67,9 @@ def normalize_case(string: str) -> str:
 
 
 def dof_id_to_enum(dof: str) -> int:
+    # Map human-friendly DOF identifiers to local integer indices.
+    # This lets YAML authors write `dof: X` or `dof: Y` which are converted
+    # to 0 and 1 respectively during schema validation.
     return {"X": 0, "Y": 1, "Z": 2}[normalize_case(dof)]
 
 
@@ -66,7 +83,7 @@ def bc_type_to_enum(bc_type: str) -> int:
 
 def valid_dof_id(dof: str):
     # extension to 2/3D: allow dof to be xyz
-    return normalize_case(dof) in {"X"}
+    return normalize_case(dof) in {"X", "Y", "Z"}
 
 
 def valid_dload_type(arg: str):
@@ -88,7 +105,7 @@ def validate_material_parameters(material: dict[str, dict[str, Any]]) -> bool:
     elastic = Schema(
         {
             "E": And(isnumeric, ispositive, error="E must be > 0"),
-            "nu": And(isnumeric, lambda x: -1.0 <= x < 0.5, error="nu must be between -1 and .5"),
+            Optional("nu", default=0.0): And(isnumeric, lambda x: -1.0 <= x < 0.5, error="nu must be between -1 and .5"),
         }
     )
     # Support for Neo-Hookean materials: accept either the same E/nu pair
@@ -110,6 +127,25 @@ def validate_material_parameters(material: dict[str, dict[str, Any]]) -> bool:
     else:
         raise ValueError(f"Unknown material {material['type']!r}")
     return True
+
+
+integration_schema = Schema(
+    And(
+        {
+            Optional("stiffness", default="analytic"): And(str, Use(lambda s: s.lower())),
+            Optional("internal", default="analytic"): And(str, Use(lambda s: s.lower())),
+            Optional("ngp", default=2): And(isnumeric, Use(int)),
+            Optional("nonlinear", default="linearize"): And(str, Use(lambda s: s.lower())),
+        }
+    )
+)
+
+# The `integration_schema` documents and validates integration-related options
+# that can be provided globally in the YAML under `wundy.integration` or
+# per-element-block under `element blocks[].element.integration`. The
+# preprocessor merges global defaults with per-block overrides so assembly
+# code can read `block['integration']` and respect user choices for gauss
+# points, internal/stiffness integration and nonlinear control.
 
 
 nodes_schema = Schema(
@@ -220,6 +256,7 @@ block_schema = Schema(
             "element": {
                 "type": And(str, valid_element_type, Use(normalize_case)),
                 Optional("properties", default=dict()): {str: object},
+                Optional("integration"): integration_schema,
             },
         },
         lambda d: validate_element(d["element"]),
@@ -234,10 +271,12 @@ input_schema = Schema(
             "boundary conditions": [boundary_schema],
             "materials": [material_schema],
             "element blocks": [block_schema],
+            Optional("dof_per_node", default=1): And(isnumeric, Use(int)),
             Optional("node sets"): [nset_schema],
             Optional("element sets"): [elset_schema],
             Optional("concentrated loads"): [cload_schema],
             Optional("distributed loads"): [dload_schema],
+            Optional("integration"): integration_schema,
         }
     }
 )

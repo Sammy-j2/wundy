@@ -1,4 +1,13 @@
 wundy:
+  # Integration options control how element integrals and nonlinear behavior
+  # are treated. `nonlinear` defaults to `linearize` which keeps the FEM
+  # solver linear while accepting Neo-Hookean material parameters. Set
+  # `nonlinear: nonlinear` to request the full Newton-Raphson path.
+  integration:
+    nonlinear: linearize
+    internal: analytic
+    ngp: 2
+
   nodes:
     - [1, 0.0]
     - [2, 1.0]

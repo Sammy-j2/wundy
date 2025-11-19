@@ -58,8 +58,20 @@ Notes:
 
 You can also specify compressible Neo‑Hookean materials. The loader accepts
 either the classic `(E, nu)` pair or Lame-style parameters `(mu, lambda)` or
-`(mu, kappa)`. The nonlinear solver path will be used when a material type
-containing `neo` and `hook` is detected (case-insensitive).
+`(mu, kappa)`. By default the solver treats Neo‑Hookean materials in a
+linear FEM context by using the small‑strain/tangent modulus (i.e. it
+``linearize``s the material). This preserves the usual linear FEM workflow
+while still allowing you to specify hyperelastic material parameters.
+
+If you want the full nonlinear Newton–Raphson solution, set the `integration`
+option `nonlinear: nonlinear` either globally or per-element-block (see
+examples below). The `integration.nonlinear` option accepts three values:
+
+- `linearize` (default): linear FEM using the small-strain tangent modulus.
+- `nonlinear`: run Newton–Raphson when any Neo‑Hookean material is present.
+- `auto`: legacy behavior — equivalent to `nonlinear` (keeps old behavior).
+
+Example material entry (Neo‑Hookean parameters):
 
 ```yaml
 materials:
@@ -71,9 +83,38 @@ materials:
     density: 1200.0
 ```
 
-When using Neo‑Hookean materials the solver performs a Newton–Raphson
-iteration with a consistent 1‑D tangent and returns the nonlinear nodal
-displacements. See the examples directory for a runnable input file.
+Global control of nonlinear behavior (request full NR globally):
+
+```yaml
+wundy:
+  integration:
+    nonlinear: nonlinear    # 'linearize'|'nonlinear'|'auto' (default 'linearize')
+    internal: analytic      # 'analytic'|'gauss' for internal force evaluation
+    ngp: 2                  # Gauss points when using 'gauss'
+```
+
+Per-block (per-element) override example — request NR for a specific block:
+
+```yaml
+element blocks:
+  - name: rubber_block
+    material: rubber
+    elements: [1]
+    element:
+      type: T1D1
+      properties:
+        area: 1.0
+      integration:
+        nonlinear: nonlinear
+        internal: gauss
+        ngp: 3
+```
+
+When `integration.nonlinear` is left as `linearize` (the default), Neo‑Hookean
+materials are accepted but the solver runs the linear FEM using the small‑strain
+tangent modulus computed from the provided parameters (E or mu/lambda). Use
+the `nonlinear` option only when you need the full geometric/material nonlinearity
+solution returned by the Newton–Raphson loop.
 
 ## Programmatic (Python) example
 
@@ -154,6 +195,58 @@ different constitutive laws, consider one of the following approaches:
 - Keep names consistent: the block's `material` field must match a
   `materials` dictionary key (case‑insensitive in YAML; programmatic
   keys are matched as provided).
+
+## Multi-DOF (`dof_per_node`) support and behavior
+
+The solver accepts a top-level `dof_per_node` integer (via YAML or
+programmatic input) which sets the number of degrees of freedom associated
+with each node. This enables using the same mesh for problems with multiple
+DOFs per node (for example, in-plane `X` and `Y` displacements) while
+preserving the simple 1‑D axial element formulation used by `first_fe_code`.
+
+Key points:
+
+- **Uniform DOFs per node:** The implementation assumes a uniform number of
+  DOFs per node across the mesh. Set `dof_per_node` in your YAML under the
+  top-level `wundy:` mapping, for example `dof_per_node: 2`.
+- **Axial DOF index:** For each node the *axial* degree of freedom is
+  assumed to be the local DOF with index `0`. That is, when `dof_per_node == 2`
+  we assume local DOFs `[0,1]` correspond to `[X, Y]` and axial coupling
+  (the bar/truss axial stiffness) only connects the local index `0` DOFs.
+- **Axial-only coupling (Option A):** The current multi-DOF support expands
+  the standard 2×2 axial element stiffness and 2-entry internal force into
+  a `2 * dof_per_node` sized element matrix/vector by placing axial entries
+  at local index `0` for each node. Non-axial DOFs are intentionally
+  uncoupled (receive zero internal contribution). This keeps the element
+  formulation simple and backward compatible.
+- **Automatic zero-prescription:** Because non-axial DOFs are uncoupled they
+  may produce rows/columns of zero in the global stiffness matrix. To avoid
+  singular systems the solver will automatically treat any *completely zero*
+  global DOF as a prescribed DOF with value `0.0` (equivalent to applying a
+  Dirichlet condition of zero). This is a conservative default: if you need
+  free non-axial DOFs (e.g. full 2D mechanics) you should use a genuinely
+  vectorial element formulation (Option B) which couples DOFs correctly.
+
+Example YAML snippet (enable two DOFs per node):
+
+```yaml
+wundy:
+  dof_per_node: 2
+  nodes:
+    - [1, 0.0]
+    - [2, 1.0]
+  # ... rest of the input follows the usual format
+```
+
+When `dof_per_node` is set to `2`, any boundary condition `dof` value such
+as `X` or `Y` is mapped to local indices `0` and `1` respectively. If a
+`dof` provided in the YAML is out of range for the declared `dof_per_node`
+the preprocessor raises a `ValueError`.
+
+If you want full vector coupling (i.e. stiffness that couples `X` and `Y`
+DOFs), let me know and I can implement the Option B vectorial element
+formulation — it requires changing element shape functions, constitutive
+coupling, and assembly for a genuinely multi-dimensional element.
 
 ---
 

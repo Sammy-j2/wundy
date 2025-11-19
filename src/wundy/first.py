@@ -1,3 +1,24 @@
+"""1D finite-element helpers and a simple FE solver used by `wundy`.
+
+This module provides a compact 1D bar/truss solver `first_fe_code` and a
+collection of element helpers used for assembly, load application, and
+material handling. The implementation intentionally targets simple axial
+elements and supports a uniform `dof_per_node` option which expands the
+standard 2×2 axial element into a `2 * dof_per_node` element matrix/vector
+by placing axial contributions into the local axial DOF (index 0) of each
+node. Non-axial DOFs are left uncoupled by design (see docs/material_models.md
+for details and rationale).
+
+Key conventions:
+- Nodes are indexed 0..N-1.
+- `dof_per_node` is a uniform integer across the mesh.
+- Local axial DOF at a node is assumed to have index 0 (e.g., `X` when
+    `dof_per_node == 2` with local DOFs `[X, Y]`).
+- To avoid singular global systems when non-axial DOFs are uncoupled, the
+    solver automatically prescribes any DOF whose global stiffness row is
+    entirely zero to value `0.0` (automatic zero-prescription).
+"""
+
 from typing import Any
 
 import numpy as np
@@ -15,6 +36,7 @@ def first_fe_code(
     materials: dict[str, Any],
     block_elem_map: dict[int, tuple[int, int]],
     integration: dict | None = None,
+    dof_per_node: int | None = None,
 ) -> dict[str, Any]:
     r"""
     Assemble and solve a 1D linear finite element (FE) problem for axial deformation.
@@ -140,7 +162,9 @@ def first_fe_code(
         as explicit API arguments.
 
         """
-    dof_per_node = 1
+    # Degrees of freedom per node: accept caller-provided value or default to 1
+    if dof_per_node is None:
+        dof_per_node = 1
     num_node = coords.shape[0]
     num_dof = num_node * dof_per_node
     K = np.zeros((num_dof, num_dof), dtype=float)
@@ -148,7 +172,13 @@ def first_fe_code(
 
     # integration options: defaults
     if integration is None:
-        integration = {"stiffness": "analytic", "internal": "analytic", "ngp": 2}
+        integration = {
+            "stiffness": "analytic",
+            "internal": "analytic",
+            "ngp": 2,
+            # how to treat nonlinear materials: 'linearize'|'nonlinear'|'auto'
+            "nonlinear": "linearize",
+        }
     ngp = int(integration.get("ngp", 2))
 
     # Decide whether a nonlinear (Neo-Hookean) solution is required.
@@ -156,15 +186,28 @@ def first_fe_code(
         t = str(m.get("type", "")).upper()
         tn = t.replace("-", "").replace("_", "")
         return "NEO" in tn and "HOOK" in tn
+    has_neo = any(is_neo_material(mat) for mat in materials.values())
 
-    nonlinear = any(is_neo_material(mat) for mat in materials.values())
+    # Decide actual runtime mode based on integration['nonlinear']:
+    # - 'linearize' (default): treat Neo-Hookean materials as linear by using
+    #    their small-strain tangent (no NR loop).
+    # - 'nonlinear': run full Newton-Raphson when Neo-Hooke materials exist.
+    # - 'auto': preserve legacy behaviour (run NR if any Neo material present).
+    nonlinear_mode = str(integration.get("nonlinear", "linearize")).lower()
+    if nonlinear_mode == "auto":
+        do_nonlin = has_neo
+    elif nonlinear_mode == "nonlinear":
+        do_nonlin = has_neo
+    else:
+        # 'linearize' or any other value => linear solution using tangent modulus
+        do_nonlin = False
 
-    # If nonlinear materials are present, solve using Newton-Raphson with
-    # consistent tangent stiffness per element (1D compressible Neo-Hookean).
-    if nonlinear:
+    # If requested, solve using Newton-Raphson with consistent tangent stiffness per element
+    # (1D compressible Neo-Hookean).
+    if do_nonlin:
         # Build constant external force vector (Neumann + dloads) and prescribed lists
         F_ext, prescribed_dofs, prescribed_vals = assemble_external_forces(
-            coords, blocks, bcs, dloads, materials, block_elem_map, dof_per_node
+            coords, blocks, bcs, dloads, materials, block_elem_map, dof_per_node, integration=integration
         )
 
         # Initialize displacement vector (prescribed DOFs set to prescribed_vals)
@@ -181,19 +224,30 @@ def first_fe_code(
             F_int = np.zeros_like(F_ext)
 
             # Assemble internal forces and tangent stiffness
+            # Note: when `dof_per_node > 1` each element contribution is
+            # expanded from the axial 2-entry/vector and 2x2/matrix into
+            # a full `2 * dof_per_node` sized element vector/matrix, placing
+            # axial contributions at local axial DOF index 0 of each node.
             for block in blocks:
+                # Merge per-block integration options (block may contain its own 'integration')
+                block_integration = dict(integration or {})
+                block_integration.update(block.get("integration", {}))
+                ngp_block = int(block_integration.get("ngp", 2))
                 A = block["element"]["properties"]["area"]
                 mat = materials[block["material"]]
                 for nodes in block["connect"]:
                     eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
-                    xe = coords[nodes]
+                    xe = coords[list(nodes)]
                     he = xe[1, 0] - xe[0, 0]
                     if np.isclose(he, 0.0):
                         raise ValueError(f"Zero-length element detected between nodes {nodes}")
 
                     # Element nodal displacements in current configuration
                     ue = u[eft]
-                    u1, u2 = float(ue[0]), float(ue[1])
+                    nd = int(dof_per_node)
+                    # axial DOF is assumed to be local index 0 at each node
+                    u1 = float(ue[0])
+                    u2 = float(ue[nd])
                     # Deformation gradient for 1D element (constant over element)
                     F_e = 1.0 + (u2 - u1) / float(he)
 
@@ -207,18 +261,42 @@ def first_fe_code(
                         dPdF = float(E)
 
                     # Element internal nodal force (reference configuration)
-                    fe_int = A * P * np.array([-1.0, 1.0], dtype=float)
-                    F_int[eft] += fe_int
+                    # Element internal nodal force (reference configuration)
+                    # Build axial (2-entry) internal force then expand to multi-DOF
+                    fe_ax = A * P * np.array([-1.0, 1.0], dtype=float)
+                    # Expand to full element DOF vector (2*dof_per_node)
+                    nd = dof_per_node
+                    fe_int_big = np.zeros(2 * nd, dtype=float)
+                    # place axial contributions into local axial DOF (index 0)
+                    fe_int_big[0] = fe_ax[0]
+                    fe_int_big[nd] = fe_ax[1]
+                    F_int[eft] += fe_int_big
 
-                    # Consistent element tangent: ke = A * dP/dF / L * [[1,-1],[-1,1]]
-                    ke = (A * dPdF / float(he)) * np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
-                    K[np.ix_(eft, eft)] += ke
+                    # Consistent element tangent: 2x2 axial ke, then expand
+                    ke_ax = (A * dPdF / float(he)) * np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
+                    ke_big = np.zeros((2 * nd, 2 * nd), dtype=float)
+                    ke_big[0, 0] = ke_ax[0, 0]
+                    ke_big[0, nd] = ke_ax[0, 1]
+                    ke_big[nd, 0] = ke_ax[1, 0]
+                    ke_big[nd, nd] = ke_ax[1, 1]
+                    K[np.ix_(eft, eft)] += ke_big
 
             # Residual
             R = F_ext - F_int
+            # Automatically constrain DOFs with zero stiffness (uncoupled DOFs)
+            # Any global DOF that has a completely zero stiffness row is
+            # effectively uncoupled by the element formulation (common when
+            # using `dof_per_node>1` with axial-only elements). To avoid
+            # singular reduced systems we conservatively treat such DOFs as
+            # prescribed to zero (same as applying a Dirichlet 0.0).
+            all_dofs = np.arange(num_dof)
+            zero_rows = np.where(np.all(np.isclose(K, 0.0, atol=1e-12), axis=1))[0]
+            for zr in zero_rows:
+                if zr not in prescribed_dofs:
+                    prescribed_dofs.append(int(zr))
+                    prescribed_vals.append(0.0)
 
             # Restrict to free DOFs and solve for increment
-            all_dofs = np.arange(num_dof)
             free_dofs = np.setdiff1d(all_dofs, prescribed_dofs)
             Kff = K[np.ix_(free_dofs, free_dofs)]
             Rf = R[free_dofs]
@@ -235,7 +313,15 @@ def first_fe_code(
             # Convergence check (residual norm)
             rnorm = np.linalg.norm(Rf)
             if rnorm < tol:
-                solution = {"dofs": u, "stiff": K, "force": F_ext}
+                # compute full residual (external - internal) for return
+                F_int_full = assemble_internal_forces(
+                    u, coords, blocks, materials, block_elem_map, dof_per_node, integration=integration
+                )
+                F_ext_full, _, _ = assemble_external_forces(
+                    coords, blocks, bcs, dloads, materials, block_elem_map, dof_per_node, integration=integration
+                )
+                R_full = F_ext_full - F_int_full
+                solution = {"dofs": u, "stiff": K, "force": F_ext, "residual": R_full}
                 return solution
 
         # If we get here, NR did not converge
@@ -244,6 +330,10 @@ def first_fe_code(
     # Nonlinear not requested: previous linear assembly path
     # Assemble global stiffness
     for block in blocks:
+        # merge per-block integration options
+        block_integration = dict(integration or {})
+        block_integration.update(block.get("integration", {}))
+        ngp_block = int(block_integration.get("ngp", 2))
         A = block["element"]["properties"]["area"]
         material = materials[block["material"]]
         E = material_tangent_modulus(material)
@@ -251,14 +341,22 @@ def first_fe_code(
             # GLOBAL DOF = NODE NUMBER x NUMBER OF DOF PER NODE + LOCAL DOF
             eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
 
-            xe = coords[nodes]
+            xe = coords[list(nodes)]
             he = xe[1, 0] - xe[0, 0]
             if np.isclose(he, 0.0):
                 raise ValueError(f"Zero-length element detected between nodes {nodes}")
-            ke = element_stiffness(
-                A, E, he, integration=integration.get("stiffness", "analytic"), ngp=ngp
+            # obtain the 2x2 axial stiffness and expand to multi-DOF element
+            # (axial contributions placed at local DOF index 0 of each node)
+            ke_ax = element_stiffness(
+                A, E, he, integration=block_integration.get("stiffness", "analytic"), ngp=ngp_block
             )
-            K[np.ix_(eft, eft)] += ke
+            nd = dof_per_node
+            ke_big = np.zeros((2 * nd, 2 * nd), dtype=float)
+            ke_big[0, 0] = ke_ax[0, 0]
+            ke_big[0, nd] = ke_ax[0, 1]
+            ke_big[nd, 0] = ke_ax[1, 0]
+            ke_big[nd, nd] = ke_ax[1, 1]
+            K[np.ix_(eft, eft)] += ke_big
 
     # Apply boundary conditions (Neumann forces and Dirichlet prescriptions)
     prescribed_dofs, prescribed_vals = apply_boundary_conditions(K, F, bcs, dof_per_node)
@@ -284,7 +382,14 @@ def first_fe_code(
     # `prescribed_dofs` and `prescribed_vals` are returned from
     # `apply_boundary_conditions` and used below for elimination.
 
+    # Automatically constrain DOFs with zero stiffness (uncoupled DOFs)
     all_dofs = np.arange(num_dof)
+    zero_rows = np.where(np.all(np.isclose(K, 0.0, atol=1e-12), axis=1))[0]
+    for zr in zero_rows:
+        if zr not in prescribed_dofs:
+            prescribed_dofs.append(int(zr))
+            prescribed_vals.append(0.0)
+
     free_dofs = np.setdiff1d(all_dofs, prescribed_dofs)
     Kff = K[np.ix_(free_dofs, free_dofs)]
     Kfp = K[np.ix_(free_dofs, prescribed_dofs)]
@@ -298,6 +403,15 @@ def first_fe_code(
 
     solution = {"dofs": dofs, "stiff": K, "force": F}
 
+    # compute and return residual = external - internal for inspection
+    F_int_full = assemble_internal_forces(
+        dofs, coords, blocks, materials, block_elem_map, dof_per_node, integration=integration
+    )
+    F_ext_full, _, _ = assemble_external_forces(
+        coords, blocks, bcs, dloads, materials, block_elem_map, dof_per_node, integration=integration
+    )
+    R_full = F_ext_full - F_int_full
+    solution["residual"] = R_full
     return solution
 
 
@@ -436,6 +550,10 @@ def apply_distributed_loads(
                 )
             block_index, local_index = block_elem_map[eid]
             block = blocks[block_index]
+            # merge block-specific integration settings
+            block_integration = dict(integration or {})
+            block_integration.update(block.get("integration", {}))
+            ngp_elem = int(block_integration.get("ngp", 2))
             nodes = block["connect"][local_index]
             xe = coords[nodes]
             he = xe[1, 0] - xe[0, 0]
@@ -463,11 +581,11 @@ def apply_distributed_loads(
             eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
 
             # If user requested gauss or q is callable, perform numerical integration
-            use_gauss = integration.get("internal", "analytic") == "gauss" if integration else False
+            use_gauss = block_integration.get("internal", "analytic") == "gauss"
             is_callable_q = callable(dload["value"]) or (dtype == "GRAV" and callable(g_spec))
             if use_gauss or is_callable_q:
                 # Gauss integration for equivalent nodal forces
-                xi_pts, wts = _gauss_1d(int(integration.get("ngp", 2)))
+                xi_pts, wts = _gauss_1d(ngp_elem)
                 fe = np.zeros(2, dtype=float)
                 x1 = xe[0, 0]
                 x2 = xe[1, 0]
@@ -487,7 +605,14 @@ def apply_distributed_loads(
                         else:
                             qx = float(q_spec) * sign
                     fe += w * N * qx * J
-                F[eft] += fe
+                # Expand 2-entry elemental force into multi-DOF element vector
+                # Place the equivalent nodal nodal force into the local axial
+                # DOF (index 0) for each node; non-axial DOFs remain zero.
+                nd = int(dof_per_node)
+                fe_big = np.zeros(2 * nd, dtype=float)
+                fe_big[0] = fe[0]
+                fe_big[nd] = fe[1]
+                F[eft] += fe_big
             else:
                 # analytic constant q per element
                 if dtype == "BX":
@@ -496,7 +621,12 @@ def apply_distributed_loads(
                     # GRAV with scalar g_spec already reduced to q_spec
                     q = float(q_spec) * sign
                 qe = q * he / 2 * np.ones(2)
-                F[eft] += qe
+                nd = int(dof_per_node)
+                # Map analytic equivalent nodal loads into axial DOFs only
+                qe_big = np.zeros(2 * nd, dtype=float)
+                qe_big[0] = qe[0]
+                qe_big[nd] = qe[1]
+                F[eft] += qe_big
 
 
 def element_stiffness(
@@ -565,36 +695,38 @@ def element_internal_force(
     ue: np.ndarray,
     integration: str = "analytic",
     ngp: int = 2,
+    dof_per_node: int = 1,
 ) -> np.ndarray:
     """Compute the elemental internal nodal force vector for a 2-node bar element.
 
-    The internal (negative internal) nodal force vector is computed as
-
-        fint_e = ke @ u_e
-
-    where ``ke`` is the elemental stiffness matrix and ``u_e`` is the element
-    displacement vector [u1, u2]. The returned vector follows the FEM sign
-    convention (internal reactions at element nodes), i.e. typically
-    [-N, +N] where N is the axial force (positive in tension).
-
-    Parameters
-    ----------
-    area, E, length : float
-        Element cross-sectional area, Young's modulus and element length.
-    ue : ndarray
-        Element nodal displacement vector with shape (2,) or (2,1).
-
-    Returns
-    -------
-    fint_e : ndarray
-        Element internal nodal force vector of shape (2,).
+    This helper supports uniform multi-DOF per node. If `ue` has length 2 it
+    behaves as before. If `ue` has length 2*dof_per_node the function extracts
+    axial DOFs (local index 0) from each node, computes the 2x2 axial internal
+    force, and expands it into a 2*dof_per_node vector placing axial entries
+    into the local axial DOF index (0) for each node. Non-axial DOFs receive
+    zero internal contribution (uncoupled axial-only behaviour).
     """
     ue = np.asarray(ue, dtype=float).ravel()
-    if ue.size != 2:
-        raise ValueError("element displacement vector `ue` must have length 2")
-    # compute ke according to requested integration and use it to form internal force
-    ke = element_stiffness(area, E, length, integration=integration, ngp=ngp)
-    return ke.dot(ue)
+    if ue.size == 2:
+        ke = element_stiffness(area, E, length, integration=integration, ngp=ngp)
+        return ke.dot(ue)
+
+    expected = 2 * int(dof_per_node)
+    if ue.size != expected:
+        raise ValueError(f"element displacement vector `ue` must have length 2 or {expected}")
+
+    # extract axial components (local axial DOF index 0)
+    nd = int(dof_per_node)
+    ue_ax = np.array([ue[0], ue[nd]], dtype=float)
+    # axial ke and axial internal force
+    ke_ax = element_stiffness(area, E, length, integration=integration, ngp=ngp)
+    fe_ax = ke_ax.dot(ue_ax)
+    # expand into full DOF vector: place fe_ax[0] at local index 0 of node0,
+    # and fe_ax[1] at local index 0 of node1
+    fe_big = np.zeros(expected, dtype=float)
+    fe_big[0] = fe_ax[0]
+    fe_big[nd] = fe_ax[1]
+    return fe_big
 
 
 def element_axial_force(area: float, E: float, length: float, ue: np.ndarray) -> float:
@@ -657,12 +789,26 @@ def assemble_internal_forces(
         A = block["element"]["properties"]["area"]
         mat = materials[block["material"]]
         E = material_tangent_modulus(mat)
-        xe = coords[nodes]
+        # merge per-block integration settings
+        block_integration = dict(integration or {})
+        block_integration.update(block.get("integration", {}))
+        ngp_elem = int(block_integration.get("ngp", 2))
+        xe = coords[list(nodes)]
         L = float(xe[1, 0] - xe[0, 0])
         eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
         ue = dofs[eft]
+        # `ue` may be length 2 (standard) or 2*dof_per_node (expanded).
+        # `element_internal_force` will extract axial DOFs (local index 0)
+        # when dof_per_node > 1 and expand the axial internal force into
+        # the larger element vector.
         fe_int = element_internal_force(
-            A, E, L, ue, integration=integration.get("internal", "analytic"), ngp=ngp
+            A,
+            E,
+            L,
+            ue,
+            integration=block_integration.get("internal", "analytic"),
+            ngp=ngp_elem,
+            dof_per_node=dof_per_node,
         )
         F_int[eft] += fe_int
 
@@ -677,6 +823,7 @@ def assemble_external_forces(
     materials: dict[str, Any],
     block_elem_map: dict[int, tuple[int, int]],
     dof_per_node: int = 1,
+    integration: dict | None = None,
 ) -> tuple[np.ndarray, list[int], list[float]]:
     """Assemble the global external force vector from Neumann BCs and dloads.
 
@@ -693,7 +840,9 @@ def assemble_external_forces(
     F_ext = np.zeros(num_dof, dtype=float)
 
     # Apply distributed loads first (they may be element-based)
-    apply_distributed_loads(F_ext, dloads, coords, blocks, materials, block_elem_map, dof_per_node)
+    apply_distributed_loads(
+        F_ext, dloads, coords, blocks, materials, block_elem_map, dof_per_node, integration=integration
+    )
 
     # Apply Neumann BCs and collect Dirichlet lists
     prescribed_dofs: list[int] = []
