@@ -203,8 +203,12 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
             continue
         if eb["material"] not in materials:
             errors += 1
+            defined = sorted(materials.keys())
             logger.error(
-                f"material {eb['material']!r}, required by element block {name}, not defined"
+                "material %r required by element block %r not defined; defined materials: %s",
+                eb["material"],
+                name,
+                defined,
             )
             continue
         block: dict[str, Any] = {}
@@ -401,7 +405,14 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     # Check if all elements are assigned to an element block
     if unassigned := set(range(num_elem)).difference(block_elem_map.keys()):
         errors += 1
-        for e in unassigned:
+        # Provide original element IDs to help the user correlate YAML ids
+        unassigned_ids = [inp["elements"][e][0] for e in sorted(unassigned)]
+        logger.error(
+            "The following element indices (0-based) are unassigned: %s; corresponding YAML element IDs: %s",
+            sorted(unassigned),
+            unassigned_ids,
+        )
+        for e in sorted(unassigned):
             logger.error(f"Element {e} is not assigned to any element blocks")
 
     if errors:

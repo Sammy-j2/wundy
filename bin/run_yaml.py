@@ -9,6 +9,13 @@ If no path is given the script uses:
 """
 
 import argparse
+import sys
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception:
+    tk = None
+    filedialog = None
 from pathlib import Path
 
 from schema import SchemaError
@@ -87,6 +94,8 @@ def run_yaml(path: str, debug: bool = False) -> None:
         # Re-raise so calling process sees the SchemaError
         raise
     inp = ui.preprocess(data)
+    # Pass through the user's requested `dof_per_node` (if present in preprocessed input)
+    dof_per_node = int(inp.get("dof_per_node", 1))
     sol = first.first_fe_code(
         inp["coords"],
         inp["blocks"],
@@ -94,6 +103,7 @@ def run_yaml(path: str, debug: bool = False) -> None:
         inp["dload"],
         inp["materials"],
         inp["block_elem_map"],
+        dof_per_node=dof_per_node,
     )
     print("dofs:", sol["dofs"])
 
@@ -103,16 +113,40 @@ def main(argv=None):
     parser.add_argument(
         "yaml",
         nargs="?",
-        default="docs/examples/material_input_example.yaml",
-        help="Path to YAML input file",
+        default=None,
+        help="Path to YAML input file. If omitted a file dialog will open",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Print detailed YAML diagnostics on schema/parse errors",
     )
+    parser.add_argument(
+        "--pick",
+        action="store_true",
+        help="Open a file dialog to pick a YAML input file (Windows GUI)",
+    )
     args = parser.parse_args(argv)
-    run_yaml(args.yaml, debug=args.debug)
+    # If the user didn't pass a YAML path or requested a GUI pick, show a file dialog
+    yaml_path = args.yaml
+    if args.pick or yaml_path is None:
+        if filedialog is None:
+            print("tkinter not available; cannot open file picker")
+            sys.exit(1)
+        # create a hidden root and open file dialog
+        root = tk.Tk()
+        root.withdraw()
+        p = filedialog.askopenfilename(
+            title="Select a wundy YAML input file",
+            filetypes=[("YAML files", "*.yaml;*.yml"), ("All files", "*.*")],
+        )
+        root.destroy()
+        if not p:
+            print("No file selected; exiting.")
+            sys.exit(1)
+        yaml_path = p
+
+    run_yaml(yaml_path, debug=args.debug)
 
 
 if __name__ == "__main__":

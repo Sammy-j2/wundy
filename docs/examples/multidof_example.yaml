@@ -1,22 +1,39 @@
 wundy:
+  # Request 2 DOFs per node (axial DOF is local index 0)
   dof_per_node: 2
+  # Simple 1D bar split into 4 elements (5 nodes)
   nodes:
     - [1, 0.0]
-    - [2, 1.0]
+    - [2, 0.25]
+    - [3, 0.5]
+    - [4, 0.75]
+    - [5, 1.0]
 
   elements:
     - [1, 1, 2]
+    - [2, 2, 3]
+    - [3, 3, 4]
+    - [4, 4, 5]
 
+  # Use a Neo-Hookean material to exercise nonlinear assembly
   materials:
-    - type: elastic
-      name: steel
+    - type: neo_hooke
+      name: rubber
       parameters:
-        E: 2.1e11
+        mu: 3.0e5
+        lambda: 2.0e5
+      density: 1200.0
+
+  # Request a nonlinear Newton-Raphson solution and use Gauss quadrature
+  integration:
+    nonlinear: nonlinear
+    internal: gauss
+    ngp: 2
 
   element blocks:
     - name: block
-      material: steel
-      elements: [1]
+      material: rubber
+      elements: [1, 2, 3, 4]
       element:
         type: T1D1
         properties:
@@ -27,7 +44,7 @@ wundy:
       dof: X
       type: DIRICHLET
       value: 0.0
-    - nodes: [2]
+    - nodes: [5]
       dof: X
       type: NEUMANN
       value: 1000.0
