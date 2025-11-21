@@ -90,6 +90,18 @@ This function is useful for analyzing **axially loaded bars** or **simple truss 
 | `"stiff"` | Assembled global stiffness matrix \( K \) |
 | `"force"` | Global force vector \( F \) after loads and BCs |
 
+### Newton–Raphson controls (nonlinear materials)
+
+If `integration.nonlinear` is set to `'nonlinear'` and Neo‑Hookean
+materials are present, the solver will run a Newton–Raphson loop using a
+consistent element tangent. You can control the solver via the `integration`
+mapping in your YAML or programmatically by providing an `integration`
+dictionary to `first_fe_code`. Supported keys include `nr_tol` (residual
+tolerance), `nr_max_it` (max iterations), and `nr_du_tol` (optional
+displacement-increment tolerance; stops when `||du|| < nr_du_tol`). The
+function returns an additional `solution["convergence"]` mapping for
+nonlinear runs describing the convergence reason and norms.
+
 ---
 
 ## Function: `global_dof`

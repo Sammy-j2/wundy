@@ -323,6 +323,9 @@ Formally, the mapping implemented is:
 \text{dof\_id\_to\_enum}(\text{"X"}) = 0.
 \]
 
+
+## Integration and Newton-Raphson controls
+
 ---
 
 ## 12) Case Handling and Normalization
@@ -428,6 +431,16 @@ Copy, edit, and save as `input.yaml`:
 wundy:
   nodes: []
   elements: []
+
+wundy:
+  integration:
+    nonlinear: nonlinear
+    internal: gauss
+    ngp: 3
+    nr_tol: 1e-8
+    nr_du_tol: 1e-10
+    nr_max_it: 50
+```
 
   materials:
     - type: ELASTIC

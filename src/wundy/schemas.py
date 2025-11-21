@@ -136,6 +136,14 @@ integration_schema = Schema(
             Optional("internal", default="analytic"): And(str, Use(lambda s: s.lower())),
             Optional("ngp", default=2): And(isnumeric, Use(int)),
             Optional("nonlinear", default="linearize"): And(str, Use(lambda s: s.lower())),
+            # Newton-Raphson solver controls (optional):
+            # - `nr_tol`: residual norm tolerance for convergence (float)
+            # - `nr_max_it`: maximum Newton iterations (int)
+            # - `nr_du_tol`: optional displacement-increment tolerance; if set,
+            #    Newton will stop when ||du|| < nr_du_tol in addition to residual
+            Optional("nr_tol", default=1e-8): And(isnumeric, Use(float)),
+            Optional("nr_max_it", default=25): And(isnumeric, Use(int)),
+            Optional("nr_du_tol"): And(isnumeric, Use(float)),
         }
     )
 )

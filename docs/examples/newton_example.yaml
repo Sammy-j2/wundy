@@ -1,0 +1,43 @@
+wundy:
+  # Simple Neo-Hookean single-element example for Newton-Raphson testing
+  nodes:
+    - [1, 0.0]
+    - [2, 1.0]
+
+  elements:
+    - [1, 1, 2]
+
+  materials:
+    - type: neo_hooke
+      name: neo_test
+      parameters:
+        mu: 3.0e5
+        lambda: 2.0e5
+      density: 1000.0
+
+  # Request a nonlinear Newton-Raphson solution and small tolerances
+  integration:
+    nonlinear: nonlinear
+    internal: analytic
+    nr_tol: 1e-8
+    nr_du_tol: 1e-10
+    nr_max_it: 50
+
+  element blocks:
+    - name: block1
+      material: neo_test
+      elements: [1]
+      element:
+        type: T1D1
+        properties:
+          area: 1.0
+
+  boundary conditions:
+    - nodes: [1]
+      dof: X
+      type: DIRICHLET
+      value: 0.0
+    - nodes: [2]
+      dof: X
+      type: NEUMANN
+      value: 1000.0

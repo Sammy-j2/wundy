@@ -9,6 +9,12 @@ by placing axial contributions into the local axial DOF (index 0) of each
 node. Non-axial DOFs are left uncoupled by design (see docs/material_models.md
 for details and rationale).
 
+Nonlinear solver notes:
+- The solver includes a Newton–Raphson path for compressible Neo‑Hookean
+    materials. Newton controls (`nr_tol`, `nr_max_it`, and the optional
+    `nr_du_tol`) are read from the `integration` mapping (global or
+    per-block) and can be used to tune convergence behavior.
+
 Key conventions:
 - Nodes are indexed 0..N-1.
 - `dof_per_node` is a uniform integer across the mesh.
@@ -216,8 +222,16 @@ def first_fe_code(
             u[pd] = pv
 
         # Newton-Raphson iterations
-        tol = 1e-8
-        max_it = 25
+        # Newton-Raphson controls (can be overridden via integration dict)
+        tol = float(integration.get("nr_tol", 1e-8))
+        max_it = int(integration.get("nr_max_it", 25))
+        # Optional displacement-increment tolerance: stop when ||du|| < nr_du_tol
+        nr_du_tol = integration.get("nr_du_tol", None)
+        if nr_du_tol is not None:
+            try:
+                nr_du_tol = float(nr_du_tol)
+            except Exception:
+                nr_du_tol = None
         for it in range(max_it):
             # Reset global tangent and internal force
             K[:, :] = 0.0
@@ -301,7 +315,7 @@ def first_fe_code(
             Kff = K[np.ix_(free_dofs, free_dofs)]
             Rf = R[free_dofs]
 
-            # Solve linear system for delta on free DOFs
+            # Solve linear system for increment on free DOFs
             try:
                 du_f = np.linalg.solve(Kff, Rf)
             except np.linalg.LinAlgError as exc:
@@ -310,8 +324,14 @@ def first_fe_code(
             # Update solution
             u[free_dofs] += du_f
 
-            # Convergence check (residual norm)
+            # Convergence checks
             rnorm = np.linalg.norm(Rf)
+            # compute full increment norm (including zeros for prescribed DOFs)
+            du_full = np.zeros(num_dof, dtype=float)
+            du_full[free_dofs] = du_f
+            du_norm = np.linalg.norm(du_full)
+
+            # Check residual tolerance first, then (optionally) displacement increment
             if rnorm < tol:
                 # compute full residual (external - internal) for return
                 F_int_full = assemble_internal_forces(
@@ -322,6 +342,24 @@ def first_fe_code(
                 )
                 R_full = F_ext_full - F_int_full
                 solution = {"dofs": u, "stiff": K, "force": F_ext, "residual": R_full}
+                solution.setdefault("convergence", {})
+                solution["convergence"]["reason"] = "residual"
+                solution["convergence"]["rnorm"] = float(rnorm)
+                return solution
+            if nr_du_tol is not None and du_norm < nr_du_tol:
+                # Converged by displacement-increment tolerance
+                F_int_full = assemble_internal_forces(
+                    u, coords, blocks, materials, block_elem_map, dof_per_node, integration=integration
+                )
+                F_ext_full, _, _ = assemble_external_forces(
+                    coords, blocks, bcs, dloads, materials, block_elem_map, dof_per_node, integration=integration
+                )
+                R_full = F_ext_full - F_int_full
+                solution = {"dofs": u, "stiff": K, "force": F_ext, "residual": R_full}
+                solution.setdefault("convergence", {})
+                solution["convergence"]["reason"] = "du_tol"
+                solution["convergence"]["du_norm"] = float(du_norm)
+                solution["convergence"]["rnorm"] = float(rnorm)
                 return solution
 
         # If we get here, NR did not converge

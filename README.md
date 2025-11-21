@@ -77,6 +77,17 @@ PY
 Alternatively, copy the snippet into a small script (for example
 `bin/run_example.py`) and run it with `python bin/run_example.py`.
 
+Alternatively, use the included runner script which accepts a YAML path
+or opens a GUI file picker on Windows:
+
+```powershell
+# run by path
+python .\bin\run_yaml.py docs\examples\material_input_example.yaml
+
+# open file picker (Windows)
+python .\bin\run_yaml.py --pick
+```
+
 ## Example: multi-DOF input
 
 An example showing `dof_per_node: 2` and how to specify `X`/`Y` DOFs is
@@ -104,4 +115,26 @@ sol = first.first_fe_code(
 print('dofs:', sol['dofs'])
 print('residual:', sol['residual'])
 PY
+```
+
+Runner note: if you enable nonlinear Newton–Raphson (see docs/material_models.md)
+you can control Newton behavior with the `integration` block in your YAML:
+
+```yaml
+wundy:
+	integration:
+		nonlinear: nonlinear    # 'linearize'|'nonlinear'|'auto'
+		internal: gauss         # 'analytic'|'gauss'
+		ngp: 2                 # number of Gauss points when using 'gauss'
+		nr_tol: 1e-8           # residual tolerance for Newton
+		nr_du_tol: 1e-10       # optional displacement-increment tolerance
+		nr_max_it: 50         # maximum Newton iterations
+```
+
+See `docs/examples/newton_example.yaml` for a working Newton example.
+
+Run the test suite with:
+
+```powershell
+pytest -q
 ```

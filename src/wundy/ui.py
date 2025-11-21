@@ -32,6 +32,10 @@ The preprocessor also handles these important behaviors:
     user-provided global `integration` block and with per-element-block
     `integration` overrides. The resulting dict is stored on each block as
     `block['integration']` for use during assembly.
+ - Numeric coercion: the loader is forgiving of numeric-looking strings
+     in material parameters and `integration` settings (for example `"1e-8"`).
+     These are coerced to `int`/`float` before schema validation so YAML
+     produced by different editors still validates.
 """
 
 
@@ -62,6 +66,49 @@ def load(file: IO[Any]) -> dict[str, dict[str, Any]]:
     except Exception:
         # be conservative: if data shape unexpected, skip coercion and let
         # schema validation handle errors
+        pass
+
+    # Coerce numeric-looking strings in 'integration' dictionaries so values
+    # like "1e-8" or "2" are accepted by the schema numeric validators.
+    try:
+        wundy = data.get("wundy", {})
+        integ = wundy.get("integration")
+        if isinstance(integ, dict):
+            for k, v in list(integ.items()):
+                if isinstance(v, str) and float_re.match(v.strip()):
+                    sval = v.strip()
+                    if re.match(r"^[+-]?\d+$", sval):
+                        try:
+                            integ[k] = int(sval)
+                            continue
+                        except Exception:
+                            pass
+                    try:
+                        integ[k] = float(sval)
+                    except Exception:
+                        pass
+
+        # Per-element-block integration entries (if present)
+        for eb in wundy.get("element blocks", []) or []:
+            belem = eb.get("element", {})
+            binteg = belem.get("integration")
+            if isinstance(binteg, dict):
+                for k, v in list(binteg.items()):
+                    if isinstance(v, str) and float_re.match(v.strip()):
+                        sval = v.strip()
+                        if re.match(r"^[+-]?\d+$", sval):
+                            try:
+                                binteg[k] = int(sval)
+                                continue
+                            except Exception:
+                                pass
+                        try:
+                            binteg[k] = float(sval)
+                        except Exception:
+                            pass
+    except Exception:
+        # If anything unexpected happens here, leave data as-is and allow
+        # the schema validation to catch/describe the problem.
         pass
 
     return input_schema.validate(data)
