@@ -6,9 +6,15 @@ finite‑element solver (`first_fe_code`) in this repository.
 Contents
 - What the solver expects
 - YAML example
+- Why PK1 stress (Neo‑Hooke rationale)
+- Neo‑Hookean EB1D bending limitation
+ - Manufactured solutions (MMS) notes
 - Programmatic (Python) example
 - How materials are used by the solver
 - Extending/custom materials
+- Quick tips
+- Multi-DOF (`dof_per_node`) support and behavior
+- Example input file
 
 ## What the solver expects
 
@@ -116,6 +122,80 @@ tangent modulus computed from the provided parameters (E or mu/lambda). Use
 the `nonlinear` option only when you need the full geometric/material nonlinearity
 solution returned by the Newton–Raphson loop.
 
+### Why we use the first Piola–Kirchhoff (PK1) stress
+
+For the 1‑D Neo‑Hookean implementation the solver forms internal forces using
+the first Piola–Kirchhoff stress $P$ and its derivative $\mathrm{d}P/\mathrm{d}F$
+with respect to the deformation gradient $F$. There are a few practical
+reasons for this choice in the current codebase:
+
+- **Work-conjugacy in the reference configuration:** Using PK1 gives internal
+  nodal forces naturally in the reference (undeformed) configuration so the
+  elemental internal force for a 2‑node bar is simply
+
+  $$f_e = A\,P\,[-1,\;1]^T$$
+
+  where $A$ is the (reference) cross‑sectional area. This leads directly to the
+  consistent element tangent used in Newton iterations:
+
+  $$k_e = \frac{A\,\mathrm{d}P}{\mathrm{d}F}\frac{1}{L}\begin{bmatrix}1 & -1\\ -1 & 1\end{bmatrix}$$
+
+- **Simplicity for 1‑D axial elements:** PK1 gives a compact, scalar mapping
+  from $F$ to an axial force that fits the existing assembly pattern (axial
+  2×2 contribution expanded for multi‑DOF support). This keeps the nonlinear
+  path implementation small and focused on material nonlinearity rather than
+  tensorial bookkeeping.
+- **Consistent tangent (Jacobian) is straightforward:** Newton–Raphson
+  convergence relies on a correct consistent tangent. For the compressible
+  Neo‑Hookean energy used here the derivative $\mathrm{d}P/\mathrm{d}F$ is
+  available in closed form (and implemented in `_neo_PK1_and_tangent`), which
+  simplifies robust NR iterations.
+
+Limitations and notes:
+
+- PK1 is a two‑point (unsymmetric) stress measure defined relative to the
+  reference configuration; it is not objective (frame‑indifferent) in the same
+  way as the Cauchy stress. For 1‑D axial bar elements and moderate rotations
+  this is acceptable, but for full 3‑D, large‑rotation formulations you would
+  typically use objective measures (e.g., the Cauchy stress with an updated
+  configuration) or the second Piola–Kirchhoff stress in a material description.
+- The current implementation uses PK1 because it provides a minimal, correct
+  nonlinear axial formulation with a matching consistent tangent; if you need
+  a fully objective, multi‑dimensional hyperelastic formulation we can extend
+  the code to use different stress measures and an updated configuration.
+
+### Neo‑Hookean with EB1D beam bending (current limitation)
+
+If you combine a Neo‑Hookean material with `EB1D` beam elements the present
+implementation treats bending linearly using the small‑strain tangent modulus
+`E`. Only axial Neo‑Hookean behavior enters the Newton–Raphson loop; rotational
+DOFs assemble the standard Euler–Bernoulli stiffness each iteration.
+
+Practical effects:
+- Large rotation / geometric nonlinear bending is not modeled (small‑angle assumption).
+- Bending stress recovery uses `E`, not a hyperelastic curvature formulation.
+- Setting `integration.nonlinear: nonlinear` still runs Newton–Raphson so axial bars
+  with Neo‑Hooke converge while beams behave linearly.
+
+Recommended usage: Use EB1D with Neo‑Hooke for problems dominated by axial
+nonlinearity or modest bending where linear curvature is acceptable. For strongly
+nonlinear bending (large tip rotations) treat results as first‑order estimates.
+
+Roadmap (future work): geometric nonlinear beam, consistent Neo‑Hookean bending tangent,
+and shear‑deformable (Timoshenko) variant.
+
+### Manufactured solutions (MMS) notes
+
+MMS are included to verify assembly and solver behavior:
+
+- Axial Neo‑Hooke (nonlinear): choose an exact field such as `u(x) = eps * x` so the
+  deformation gradient `F = 1 + eps` is constant. Drive with a tip traction approximating
+  PK1 (`T ≈ E * eps * A`) or using the exact PK1 expression; the NR path converges to the
+  target linear field. See `tests/test_axial_mms_nonlinear.py`.
+- EB1D beam: run MMS in `integration.nonlinear: linearize` to avoid singular tangents in
+  pure beam problems. Loads can be derived from a chosen `w(x)` via `q(x) = E I w''''(x)`
+  or set to a uniform value to exercise distributed load mapping. See `tests/test_beam_mms.py`.
+
 ## Programmatic (Python) example
 
 You can provide the same data directly to `first_fe_code` as a Python
@@ -154,11 +234,9 @@ sigma = first.element_stress(area, materials["steel"], L, ue)
 print("element stress (Pa):", sigma)
 ```
 
+
 ## How materials are used by the solver
 
-- At assembly time the code looks up the block's material by name and
-  calls `material_tangent_modulus(material)` to obtain `E` for use in the
-  analytic element stiffness formula ke = (A*E/L) * [[1,-1],[-1,1]].
 - For grav‑type distributed loads the solver uses `density` from the
   material definition to compute a per‑length body force `q = rho * A * g`.
 - The helper `material_constitutive` returns a 1×1 constitutive matrix

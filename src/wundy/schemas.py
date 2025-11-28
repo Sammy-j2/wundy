@@ -24,13 +24,17 @@ NEUMANN = 0
 DIRICHLET = 1
 
 
-element_types = {"T1D1"}
+element_types = {"T1D1", "EB1D"}
 bc_types = {"DIRICHLET", "NEUMANN"}
 
 
 def node_freedom_table(elem_type: str) -> tuple[int, ...]:
     if normalize_case(elem_type) == "T1D1":
         return (1, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    if normalize_case(elem_type) == "EB1D":
+        # Placeholder: using same format as T1D1 table; UI/solver use dof_per_node
+        # Beam requires at least 2 DOFs per node (w, theta)
+        return (1, 1, 0, 0, 0, 0, 0, 0, 0, 0)
     raise ValueError(f"Unknown element type {elem_type!r}")
 
 
@@ -88,12 +92,20 @@ def valid_dof_id(dof: str):
 
 def valid_dload_type(arg: str):
     # extension to 2/3D: allow other DLOADs
-    return normalize_case(arg) in {"BX", "GRAV"}
+    return normalize_case(arg) in {"BX", "GRAV", "QY", "QBEAM"}
 
 
 def validate_element(elem: dict[str, Any]) -> bool:
     if normalize_case(elem["type"]) == "T1D1":
         schema = Schema({Optional("area", default=1.0): And(isnumeric, ispositive)})
+        v = schema.validate(elem["properties"])
+        elem["properties"].update(v)
+    elif normalize_case(elem["type"]) == "EB1D":
+        # Euler–Bernoulli 1D beam: require second moment of area I (>0).
+        schema = Schema({
+            "I": And(isnumeric, ispositive),
+            Optional("area", default=1.0): And(isnumeric, ispositive),
+        })
         v = schema.validate(elem["properties"])
         elem["properties"].update(v)
     else:
@@ -228,7 +240,9 @@ dload_schema = Schema(
                 And(list, list_of_int),  # list of elements
             ),
             "type": And(str, valid_dload_type, Use(normalize_case)),
-            "value": Use(float),
+            Optional("value"): Use(float),  # constant magnitude (axial or transverse)
+            Optional("table"): And(list, lambda rows: all(len(r)==2 for r in rows)),  # [[x,q],...]
+            Optional("expression"): And(str, len),  # string expression in x (and optionally L)
             "direction": And(
                 list,
                 list_of_numeric,

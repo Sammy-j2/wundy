@@ -1,0 +1,43 @@
+wundy:
+  dof_per_node: 2
+  nodes:
+    - [0, 0.0]
+    - [1, 1.0]
+  elements:
+    - [0, 0, 1]
+  materials:
+    - name: rubber
+      type: neo_hooke
+      parameters:
+        E: 200000.0
+        nu: 0.3
+  element blocks:
+    - name: beamblk
+      material: rubber
+      elements: [0]
+      element:
+        type: EB1D
+        properties:
+          I: 1.0e-6
+          area: 1.0
+        integration:
+          ngp: 3
+  integration:
+    nonlinear: nonlinear
+  boundary conditions:
+    - name: clampw
+      nodes: [0]
+      dof: X
+      value: 0.0
+      type: DIRICHLET
+    - name: clamptheta
+      nodes: [0]
+      dof: Y
+      value: 0.0
+      type: DIRICHLET
+  distributed loads:
+    - name: q_linear
+      elements: [0]
+      type: QY
+      expression: "100.0 * x / L"
+      direction: [1]

@@ -49,66 +49,54 @@ def load(file: IO[Any]) -> dict[str, dict[str, Any]]:
     text = file.read()
     data = yaml.safe_load(text)
 
-    # Coerce numeric-looking strings in material parameters to floats so the
+    # Helper: coerce numeric-looking string values to int/float in a mapping.
+    NUMERIC_RE = re.compile(r"^[+-]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?$")
+
+    def _coerce_numeric_str(v: Any) -> Any:
+        if isinstance(v, str) and NUMERIC_RE.match(v.strip()):
+            sval = v.strip()
+            if re.fullmatch(r"[+-]?\d+", sval):
+                try:
+                    return int(sval)
+                except Exception:
+                    pass
+            try:
+                return float(sval)
+            except Exception:
+                pass
+        return v
+
+    def _coerce_mapping(mapping: dict[str, Any]) -> None:
+        for k, v in list(mapping.items()):
+            mapping[k] = _coerce_numeric_str(v)
+
+    # Coerce numeric-looking strings in material parameters to numbers so the
     # schema's numeric checks succeed even if PyYAML returned strings.
-    float_re = re.compile(r"^[+-]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?$")
     try:
         mats = data.get("wundy", {}).get("materials", [])
         for m in mats:
             params = m.get("parameters", {})
-            for k, v in list(params.items()):
-                if isinstance(v, str) and float_re.match(v.strip()):
-                    try:
-                        params[k] = float(v)
-                    except Exception:
-                        # leave as-is if conversion fails
-                        pass
+            if isinstance(params, dict):
+                _coerce_mapping(params)
     except Exception:
-        # be conservative: if data shape unexpected, skip coercion and let
-        # schema validation handle errors
+        # If the structure isn't as expected, skip coercion and allow schema
+        # validation to report the problem.
         pass
 
-    # Coerce numeric-looking strings in 'integration' dictionaries so values
-    # like "1e-8" or "2" are accepted by the schema numeric validators.
+    # Coerce numeric-looking strings in top-level and per-block 'integration'
+    # dictionaries so values like "1e-8" or "2" are accepted by the schema.
     try:
         wundy = data.get("wundy", {})
         integ = wundy.get("integration")
         if isinstance(integ, dict):
-            for k, v in list(integ.items()):
-                if isinstance(v, str) and float_re.match(v.strip()):
-                    sval = v.strip()
-                    if re.match(r"^[+-]?\d+$", sval):
-                        try:
-                            integ[k] = int(sval)
-                            continue
-                        except Exception:
-                            pass
-                    try:
-                        integ[k] = float(sval)
-                    except Exception:
-                        pass
+            _coerce_mapping(integ)
 
-        # Per-element-block integration entries (if present)
         for eb in wundy.get("element blocks", []) or []:
             belem = eb.get("element", {})
             binteg = belem.get("integration")
             if isinstance(binteg, dict):
-                for k, v in list(binteg.items()):
-                    if isinstance(v, str) and float_re.match(v.strip()):
-                        sval = v.strip()
-                        if re.match(r"^[+-]?\d+$", sval):
-                            try:
-                                binteg[k] = int(sval)
-                                continue
-                            except Exception:
-                                pass
-                        try:
-                            binteg[k] = float(sval)
-                        except Exception:
-                            pass
+                _coerce_mapping(binteg)
     except Exception:
-        # If anything unexpected happens here, leave data as-is and allow
-        # the schema validation to catch/describe the problem.
         pass
 
     return input_schema.validate(data)
@@ -117,6 +105,11 @@ def load(file: IO[Any]) -> dict[str, dict[str, Any]]:
 def set_element_defaults(elem: dict[str, Any]) -> bool:
     if elem["type"].upper() == "T1D1":
         nft = (1, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        props = {"node_per_elem": 2, "freedom_table": [nft, nft]}
+        elem["properties"].update(props)
+    elif elem["type"].upper() == "EB1D":
+        # Euler–Bernoulli beam element defaults. Requires I in properties.
+        nft = (1, 1, 0, 0, 0, 0, 0, 0, 0, 0)
         props = {"node_per_elem": 2, "freedom_table": [nft, nft]}
         elem["properties"].update(props)
     else:
@@ -215,6 +208,22 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
     # Put materials in dictionary for easier look up
     materials: dict[str, Any] = preprocessed.setdefault("materials", {})
+    # Integration options: global defaults merged with user-provided top-level settings
+    default_integration = {
+        "stiffness": "analytic",
+        "internal": "analytic",
+        "ngp": 2,
+        "nonlinear": "linearize",
+    }
+    user_integration = inp.get("integration") or {}
+    try:
+        if isinstance(user_integration.get("ngp", None), str):
+            user_integration["ngp"] = int(user_integration["ngp"])
+    except Exception:
+        pass
+    global_integration = {**default_integration, **user_integration}
+    preprocessed["integration"] = global_integration
+
     for material in inp["materials"]:
         name = material["name"]
         if name in materials:
@@ -222,23 +231,6 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
             logger.error(f"Duplicate material {name!r}")
         else:
             materials[name] = {"type": material["type"], "parameters": material["parameters"]}
-    
-        # Integration options: global defaults merged with user-provided top-level settings
-        default_integration = {
-            "stiffness": "analytic",
-            "internal": "analytic",
-            "ngp": 2,
-            "nonlinear": "linearize",
-        }
-        user_integration = inp.get("integration") or {}
-        # ensure ngp is an int when supplied as string
-        try:
-            if isinstance(user_integration.get("ngp", None), str):
-                user_integration["ngp"] = int(user_integration["ngp"])
-        except Exception:
-            pass
-        global_integration = {**default_integration, **user_integration}
-        preprocessed["integration"] = global_integration
 
     # Put element blocks in dictionary for easier look up
     blocks: list[Any] = preprocessed.setdefault("blocks", [])
@@ -430,15 +422,25 @@ def preprocess(data: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
                     )
                 else:
                     elems.append(elem_map[e])
-        dload.append(
-            {
-                "name": name,
-                "elements": elems,
-                "type": dl["type"],
-                "value": dl["value"],
-                "direction": dl["direction"],
-            }
-        )
+        # Validate that at least one of value/table/expression exists
+        if not any(k in dl for k in ("value", "table", "expression")):
+            errors += 1
+            logger.error(
+                f"Distributed load {name} must define one of 'value', 'table', or 'expression'"
+            )
+        entry = {
+            "name": name,
+            "elements": elems,
+            "type": dl["type"],
+            "direction": dl["direction"],
+        }
+        if "value" in dl:
+            entry["value"] = dl["value"]
+        if "table" in dl:
+            entry["table"] = dl["table"]
+        if "expression" in dl:
+            entry["expression"] = dl["expression"]
+        dload.append(entry)
 
     # Create a mapping from global element index to block index, local elem index (within the block)
     block_elem_map: dict[int, tuple[int, int]] = preprocessed.setdefault("block_elem_map", {})

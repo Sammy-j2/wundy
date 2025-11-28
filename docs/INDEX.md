@@ -1,0 +1,21 @@
+# Wundy Docs Index
+
+- Getting Started
+  - README.md (install, usage, examples)
+- Materials
+  - docs/material_models.md (PK1 rationale, Neo‑Hooke axial, EB1D linearization, MMS notes)
+- Examples
+  - docs/examples/material_input_example.yaml
+  - docs/examples/multidof_example.yaml
+  - docs/examples/beam_uniform.yaml
+  - docs/examples/beam_triangular.yaml
+- Tests as references
+  - tests/test_beam_yaml.py (uniform and expression beam loads)
+  - tests/test_beam_mms.py (beam MMS in linearize mode)
+  - tests/test_axial_mms_nonlinear.py (axial Neo‑Hooke MMS under NR)
+- Pipeline
+  - Use `ui.load` (YAML) → `ui.preprocess` → `first.first_fe_code` for all runs
+- Integration & NR Controls
+  - `integration.internal|stiffness`: `analytic` or `gauss` (with `ngp`)
+  - `integration.nonlinear`: `linearize` | `nonlinear` | `auto`
+  - NR: `nr_tol`, `nr_max_it`, `nr_du_tol` (optional)

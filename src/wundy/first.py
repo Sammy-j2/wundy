@@ -17,7 +17,7 @@ Nonlinear solver notes:
 
 Key conventions:
 - Nodes are indexed 0..N-1.
-- `dof_per_node` is a uniform integer across the mesh.
+- `dof_per_node` is a uniform integer acros the mesh.
 - Local axial DOF at a node is assumed to have index 0 (e.g., `X` when
     `dof_per_node == 2` with local DOFs `[X, Y]`).
 - To avoid singular global systems when non-axial DOFs are uncoupled, the
@@ -45,12 +45,13 @@ def first_fe_code(
     dof_per_node: int | None = None,
 ) -> dict[str, Any]:
     r"""
-    Assemble and solve a 1D linear finite element (FE) problem for axial deformation.
+    Assemble and solve a 1D finite element (FE) problem for axial bars and EB1D beams.
 
-    This function performs the full finite element procedure for a 1D bar under
-    axial loading. It assembles the global stiffness matrix `K` and force vector `F`
-    from element, boundary condition, and material definitions, then applies both
-    Neumann (traction/force) and Dirichlet (displacement) boundary conditions.
+    This function performs the full finite element procedure for a 1D domain under
+    axial loading (bars) and/or Euler–Bernoulli bending (beams). It assembles the global
+    stiffness matrix `K` and force vector `F` from element, boundary condition, and material
+    definitions, then applies both Neumann (traction/force) and Dirichlet (displacement)
+    boundary conditions.
     The system of equations
 
         K * u = F
@@ -148,24 +149,21 @@ def first_fe_code(
         >>> result["dofs"]
         array([0.0, 4.7619e-06])  # approximate
 
-        Additional notes about nonlinear materials
-        -----------------------------------------
+                Nonlinear materials and NR path
+                -------------------------------
 
-        If any material in the `materials` database has a type containing both
-        the tokens `neo` and `hook` (case-insensitive, underscores or hyphens
-        allowed), the solver will switch to a nonlinear Newton–Raphson solution
-        path for the whole problem. In that case:
+                If any material in the `materials` database has a type containing both
+                the tokens `neo` and `hook` (case-insensitive, underscores or hyphens
+                allowed), and `integration.nonlinear` requests `nonlinear`, the solver
+                switches to a Newton–Raphson path. In that case:
 
-        - Element internal forces are formed using a 1‑D compressible
-            Neo‑Hookean model and a consistent tangent (see `_neo_PK1_and_tangent`).
-        - The Newton iteration uses a default residual tolerance of 1e-8 and a
-            maximum of 25 iterations. If Newton fails to converge the solver
-            raises a RuntimeError describing the final residual.
-
-        At present the nonlinear path is automatic and uses the material
-        parameters supplied in the YAML (either E/nu or mu/lambda/mu/kappa).
-        Future releases may expose NR controls (tolerance, max iterations)
-        as explicit API arguments.
+                - Axial element internal forces are formed using a 1‑D compressible
+                    Neo‑Hookean model and a consistent tangent (see `_neo_PK1_and_tangent`).
+                - EB1D bending is currently treated linearly using the tangent modulus `E`
+                    (no geometric nonlinearity for rotations), allowing mixed axial+beam problems
+                    to run NR stably while beams contribute linear stiffness.
+                - Newton controls can be provided via `integration`: `nr_tol`, `nr_max_it`, and
+                    optional `nr_du_tol`.
 
         """
     # Degrees of freedom per node: accept caller-provided value or default to 1
@@ -211,6 +209,7 @@ def first_fe_code(
     # If requested, solve using Newton-Raphson with consistent tangent stiffness per element
     # (1D compressible Neo-Hookean).
     if do_nonlin:
+        # Extend nonlinear path: treat EB1D beam elements as linear (use tangent E) inside NR.
         # Build constant external force vector (Neumann + dloads) and prescribed lists
         F_ext, prescribed_dofs, prescribed_vals = assemble_external_forces(
             coords, blocks, bcs, dloads, materials, block_elem_map, dof_per_node, integration=integration
@@ -247,53 +246,60 @@ def first_fe_code(
                 block_integration = dict(integration or {})
                 block_integration.update(block.get("integration", {}))
                 ngp_block = int(block_integration.get("ngp", 2))
-                A = block["element"]["properties"]["area"]
                 mat = materials[block["material"]]
                 for nodes in block["connect"]:
-                    eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
                     xe = coords[list(nodes)]
                     he = xe[1, 0] - xe[0, 0]
                     if np.isclose(he, 0.0):
                         raise ValueError(f"Zero-length element detected between nodes {nodes}")
-
-                    # Element nodal displacements in current configuration
-                    ue = u[eft]
-                    nd = int(dof_per_node)
-                    # axial DOF is assumed to be local index 0 at each node
-                    u1 = float(ue[0])
-                    u2 = float(ue[nd])
-                    # Deformation gradient for 1D element (constant over element)
-                    F_e = 1.0 + (u2 - u1) / float(he)
-
-                    # Compute first Piola-Kirchhoff stress P and its derivative dP/dF
-                    if is_neo_material(mat):
-                        P, dPdF = _neo_PK1_and_tangent(mat, F_e)
+                    elem_type = str(block.get("element", {}).get("type", "T1D1")).upper()
+                    if elem_type == "T1D1":
+                        A = block["element"]["properties"]["area"]
+                        eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
+                        ue = u[eft]
+                        nd = int(dof_per_node)
+                        u1 = float(ue[0])
+                        u2 = float(ue[nd])
+                        F_e = 1.0 + (u2 - u1) / float(he)
+                        if is_neo_material(mat):
+                            P, dPdF = _neo_PK1_and_tangent(mat, F_e)
+                            eps_e = (u2 - u1) / float(he)
+                            print(f"[Neo-Hooke] elem {nodes} axial strain = {eps_e}")
+                        else:
+                            E_lin = material_tangent_modulus(mat)
+                            P = E_lin * (F_e - 1.0)
+                            dPdF = float(E_lin)
+                        fe_ax = A * P * np.array([-1.0, 1.0], dtype=float)
+                        fe_int_big = np.zeros(2 * nd, dtype=float)
+                        fe_int_big[0] = fe_ax[0]
+                        fe_int_big[nd] = fe_ax[1]
+                        F_int[eft] += fe_int_big
+                        ke_ax = (A * dPdF / float(he)) * np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
+                        ke_big = np.zeros((2 * nd, 2 * nd), dtype=float)
+                        ke_big[0, 0] = ke_ax[0, 0]
+                        ke_big[0, nd] = ke_ax[0, 1]
+                        ke_big[nd, 0] = ke_ax[1, 0]
+                        ke_big[nd, nd] = ke_ax[1, 1]
+                        K[np.ix_(eft, eft)] += ke_big
+                    elif elem_type == "EB1D":
+                        # Linear elastic beam contribution (no geometric nonlinearity yet)
+                        if dof_per_node < 2:
+                            raise ValueError("EB1D elements require dof_per_node >= 2 (w, theta)")
+                        I = float(block["element"]["properties"]["I"])
+                        E_lin = material_tangent_modulus(mat)
+                        eft_b = [
+                            global_dof(int(nodes[0]), 0, dof_per_node),
+                            global_dof(int(nodes[0]), 1, dof_per_node),
+                            global_dof(int(nodes[1]), 0, dof_per_node),
+                            global_dof(int(nodes[1]), 1, dof_per_node),
+                        ]
+                        ue_b = u[eft_b]
+                        ke_b = ke_beam(E_lin, I, float(he))
+                        fe_b = ke_b.dot(ue_b)
+                        F_int[eft_b] += fe_b
+                        K[np.ix_(eft_b, eft_b)] += ke_b
                     else:
-                        # Material is linear elastic; use P = E*(F-1), dP/dF = E
-                        E = material_tangent_modulus(mat)
-                        P = E * (F_e - 1.0)
-                        dPdF = float(E)
-
-                    # Element internal nodal force (reference configuration)
-                    # Element internal nodal force (reference configuration)
-                    # Build axial (2-entry) internal force then expand to multi-DOF
-                    fe_ax = A * P * np.array([-1.0, 1.0], dtype=float)
-                    # Expand to full element DOF vector (2*dof_per_node)
-                    nd = dof_per_node
-                    fe_int_big = np.zeros(2 * nd, dtype=float)
-                    # place axial contributions into local axial DOF (index 0)
-                    fe_int_big[0] = fe_ax[0]
-                    fe_int_big[nd] = fe_ax[1]
-                    F_int[eft] += fe_int_big
-
-                    # Consistent element tangent: 2x2 axial ke, then expand
-                    ke_ax = (A * dPdF / float(he)) * np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
-                    ke_big = np.zeros((2 * nd, 2 * nd), dtype=float)
-                    ke_big[0, 0] = ke_ax[0, 0]
-                    ke_big[0, nd] = ke_ax[0, 1]
-                    ke_big[nd, 0] = ke_ax[1, 0]
-                    ke_big[nd, nd] = ke_ax[1, 1]
-                    K[np.ix_(eft, eft)] += ke_big
+                        raise ValueError(f"Unknown element type {elem_type!r} in NR assembly")
 
             # Residual
             R = F_ext - F_int
@@ -372,29 +378,47 @@ def first_fe_code(
         block_integration = dict(integration or {})
         block_integration.update(block.get("integration", {}))
         ngp_block = int(block_integration.get("ngp", 2))
-        A = block["element"]["properties"]["area"]
         material = materials[block["material"]]
         E = material_tangent_modulus(material)
+        elem_type = str(block.get("element", {}).get("type", "T1D1")).upper()
         for nodes in block["connect"]:
-            # GLOBAL DOF = NODE NUMBER x NUMBER OF DOF PER NODE + LOCAL DOF
-            eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
-
             xe = coords[list(nodes)]
             he = xe[1, 0] - xe[0, 0]
             if np.isclose(he, 0.0):
                 raise ValueError(f"Zero-length element detected between nodes {nodes}")
-            # obtain the 2x2 axial stiffness and expand to multi-DOF element
-            # (axial contributions placed at local DOF index 0 of each node)
-            ke_ax = element_stiffness(
-                A, E, he, integration=block_integration.get("stiffness", "analytic"), ngp=ngp_block
-            )
-            nd = dof_per_node
-            ke_big = np.zeros((2 * nd, 2 * nd), dtype=float)
-            ke_big[0, 0] = ke_ax[0, 0]
-            ke_big[0, nd] = ke_ax[0, 1]
-            ke_big[nd, 0] = ke_ax[1, 0]
-            ke_big[nd, nd] = ke_ax[1, 1]
-            K[np.ix_(eft, eft)] += ke_big
+
+            if elem_type == "T1D1":
+                A = block["element"]["properties"]["area"]
+                # GLOBAL DOF = NODE NUMBER x NUMBER OF DOF PER NODE + LOCAL DOF
+                eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
+                # obtain the 2x2 axial stiffness and expand to multi-DOF element
+                # (axial contributions placed at local DOF index 0 of each node)
+                ke_ax = element_stiffness(
+                    A, E, he, integration=block_integration.get("stiffness", "analytic"), ngp=ngp_block
+                )
+                nd = dof_per_node
+                ke_big = np.zeros((2 * nd, 2 * nd), dtype=float)
+                ke_big[0, 0] = ke_ax[0, 0]
+                ke_big[0, nd] = ke_ax[0, 1]
+                ke_big[nd, 0] = ke_ax[1, 0]
+                ke_big[nd, nd] = ke_ax[1, 1]
+                K[np.ix_(eft, eft)] += ke_big
+            elif elem_type == "EB1D":
+                # Beam requires at least 2 DOFs per node: [w, theta]
+                if dof_per_node < 2:
+                    raise ValueError("EB1D elements require dof_per_node >= 2 (w, theta)")
+                I = float(block["element"]["properties"]["I"])
+                ke_b = ke_beam(E, I, float(he))
+                # Element DOF ordering: [w1, th1, w2, th2] mapped to local indices 0,1 per node
+                eft_b = [
+                    global_dof(int(nodes[0]), 0, dof_per_node),
+                    global_dof(int(nodes[0]), 1, dof_per_node),
+                    global_dof(int(nodes[1]), 0, dof_per_node),
+                    global_dof(int(nodes[1]), 1, dof_per_node),
+                ]
+                K[np.ix_(eft_b, eft_b)] += ke_b
+            else:
+                raise ValueError(f"Unknown element type {elem_type!r} in assembly")
 
     # Apply boundary conditions (Neumann forces and Dirichlet prescriptions)
     prescribed_dofs, prescribed_vals = apply_boundary_conditions(K, F, bcs, dof_per_node)
@@ -596,6 +620,7 @@ def apply_distributed_loads(
             xe = coords[nodes]
             he = xe[1, 0] - xe[0, 0]
             A = block["element"]["properties"]["area"]
+            elem_type = str(block.get("element", {}).get("type", "T1D1")).upper()
             # prepare q(x) evaluation: handle gravity and BX
             if dtype == "BX":
                 q_spec = dload["value"]
@@ -613,6 +638,93 @@ def apply_distributed_loads(
                     q_const = float(rho * A * g_spec)
                     q_func = None
                     q_spec = q_const
+            elif dtype in {"QY", "QBEAM"}:
+                # Transverse beam distributed load; element must be EB1D
+                if elem_type != "EB1D":
+                    raise ValueError(
+                        f"Distributed load {dload['name']} type {dtype} applied to non-EB1D element"
+                    )
+                # Build equivalent nodal loads for beam DOFs [w1, th1, w2, th2]
+                # Support constant value, table interpolation, or expression.
+                table = dload.get("table")
+                expr = dload.get("expression")
+                has_constant = "value" in dload
+
+                def _safe_eval(expr_str: str, x: float, L: float) -> float:
+                    import math
+                    safe_ns = {
+                        **{n: getattr(math, n) for n in [
+                            "sin", "cos", "tan", "exp", "log", "sqrt", "pi"
+                        ]},
+                        "x": x,
+                        "L": L,
+                    }
+                    return float(eval(expr_str, {"__builtins__": {}}, safe_ns))
+
+                def _q_of_x(x: float, L: float) -> float:
+                    if table:
+                        # linear interpolation of table (assumes sorted by x)
+                        xs = [float(r[0]) for r in table]
+                        qs = [float(r[1]) for r in table]
+                        if x <= xs[0]:
+                            return qs[0]
+                        if x >= xs[-1]:
+                            return qs[-1]
+                        for i in range(len(xs) - 1):
+                            if xs[i] <= x <= xs[i + 1]:
+                                t = (x - xs[i]) / (xs[i + 1] - xs[i])
+                                return qs[i] + t * (qs[i + 1] - qs[i])
+                        return qs[-1]
+                    if expr:
+                        return _safe_eval(expr, x, L)
+                    if has_constant:
+                        val = dload["value"]
+                        if callable(val):
+                            return float(val(x))
+                        return float(val)
+                    raise ValueError(
+                        f"Beam distributed load {dload['name']} requires one of value/table/expression"
+                    )
+
+                # Hermite beam shape functions N1..N4 as functions of xi in [-1,1]
+                def _beam_shape_funcs(xi: float, L: float) -> np.ndarray:
+                    # Standard cubic Hermite element (2-node) shape functions for w,theta
+                    # Using dimensionless coordinate xi mapped from [-1,1]
+                    # Reference formulation:
+                    # N1 = 1/4*(1 - xi)**2*(2 + xi)
+                    # N2 = L/8*(1 - xi)**2*(1 + xi)
+                    # N3 = 1/4*(1 + xi)**2*(2 - xi)
+                    # N4 = L/8*(1 + xi)**2*(xi - 1)
+                    N1 = 0.25 * (1.0 - xi) ** 2 * (2.0 + xi)
+                    N2 = L * 0.125 * (1.0 - xi) ** 2 * (1.0 + xi)
+                    N3 = 0.25 * (1.0 + xi) ** 2 * (2.0 - xi)
+                    N4 = L * 0.125 * (1.0 + xi) ** 2 * (xi - 1.0)
+                    return np.array([N1, N2, N3, N4], dtype=float)
+
+                # Perform Gauss integration for general q(x); for constant load we can use closed form
+                xi_pts, wts = _gauss_1d(ngp_elem)
+                fe_b = np.zeros(4, dtype=float)
+                x1 = xe[0, 0]
+                x2 = xe[1, 0]
+                L = float(he)
+                J = L / 2.0
+                for xi, w in zip(xi_pts, wts):
+                    N = _beam_shape_funcs(xi, L)
+                    # physical x
+                    x = 0.5 * (1 - xi) * x1 + 0.5 * (1 + xi) * x2
+                    qx = _q_of_x(x, L) * sign
+                    fe_b += w * N * qx * J
+                # Map to global DOFs [w1, th1, w2, th2]
+                if dof_per_node < 2:
+                    raise ValueError("EB1D elements require dof_per_node >= 2 for distributed load mapping")
+                eft_b = [
+                    global_dof(int(nodes[0]), 0, dof_per_node),
+                    global_dof(int(nodes[0]), 1, dof_per_node),
+                    global_dof(int(nodes[1]), 0, dof_per_node),
+                    global_dof(int(nodes[1]), 1, dof_per_node),
+                ]
+                F[eft_b] += fe_b
+                continue  # done with this element/beam load
             else:
                 raise NotImplementedError(f"dload type {dtype!r} not supported for 1D")
 
@@ -824,31 +936,44 @@ def assemble_internal_forces(
     for eid, (block_index, local_index) in block_elem_map.items():
         block = blocks[block_index]
         nodes = block["connect"][local_index]
-        A = block["element"]["properties"]["area"]
         mat = materials[block["material"]]
         E = material_tangent_modulus(mat)
+        elem_type = str(block.get("element", {}).get("type", "T1D1")).upper()
         # merge per-block integration settings
         block_integration = dict(integration or {})
         block_integration.update(block.get("integration", {}))
         ngp_elem = int(block_integration.get("ngp", 2))
         xe = coords[list(nodes)]
         L = float(xe[1, 0] - xe[0, 0])
-        eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
-        ue = dofs[eft]
-        # `ue` may be length 2 (standard) or 2*dof_per_node (expanded).
-        # `element_internal_force` will extract axial DOFs (local index 0)
-        # when dof_per_node > 1 and expand the axial internal force into
-        # the larger element vector.
-        fe_int = element_internal_force(
-            A,
-            E,
-            L,
-            ue,
-            integration=block_integration.get("internal", "analytic"),
-            ngp=ngp_elem,
-            dof_per_node=dof_per_node,
-        )
-        F_int[eft] += fe_int
+        if elem_type == "T1D1":
+            A = block["element"]["properties"]["area"]
+            eft = [global_dof(n, j, dof_per_node) for n in nodes for j in range(dof_per_node)]
+            ue = dofs[eft]
+            fe_int = element_internal_force(
+                A,
+                E,
+                L,
+                ue,
+                integration=block_integration.get("internal", "analytic"),
+                ngp=ngp_elem,
+                dof_per_node=dof_per_node,
+            )
+            F_int[eft] += fe_int
+        elif elem_type == "EB1D":
+            if dof_per_node < 2:
+                raise ValueError("EB1D elements require dof_per_node >= 2 (w, theta)")
+            I = float(block["element"]["properties"]["I"])
+            eft_b = [
+                global_dof(int(nodes[0]), 0, dof_per_node),
+                global_dof(int(nodes[0]), 1, dof_per_node),
+                global_dof(int(nodes[1]), 0, dof_per_node),
+                global_dof(int(nodes[1]), 1, dof_per_node),
+            ]
+            ue_b = dofs[eft_b]
+            fe_b = element_internal_force_beam(E, I, L, ue_b)
+            F_int[eft_b] += fe_b
+        else:
+            raise ValueError(f"Unknown element type {elem_type!r} in internal force assembly")
 
     return F_int
 
@@ -1019,6 +1144,8 @@ def _neo_PK1_and_tangent(material: dict, F: float) -> tuple[float, float]:
         raise ValueError(
             "Neo-Hookean material requires either (E,nu) or (mu,lambda) or (mu,kappa) in parameters"
         )
+        
+    # assert 0, "here I am"
 
     # compute P and dP/dF
     lnF = float(np.log(F))
@@ -1082,3 +1209,34 @@ def element_stress(area: float, material: dict, length: float, ue: np.ndarray) -
     """
     eps = element_strain(length, ue)
     return element_stress_from_strain(material, eps)
+
+
+def ke_beam(E: float, I: float, L: float) -> np.ndarray:
+    """Return the 4x4 Euler–Bernoulli beam element stiffness matrix.
+
+    DOF ordering per element: [w1, theta1, w2, theta2].
+    """
+    if np.isclose(L, 0.0):
+        raise ValueError("Zero-length element provided to ke_beam")
+    k = E * I / (L ** 3)
+    return k * np.array(
+        [
+            [12.0, 6.0 * L, -12.0, 6.0 * L],
+            [6.0 * L, 4.0 * L * L, -6.0 * L, 2.0 * L * L],
+            [-12.0, -6.0 * L, 12.0, -6.0 * L],
+            [6.0 * L, 2.0 * L * L, -6.0 * L, 4.0 * L * L],
+        ],
+        dtype=float,
+    )
+
+
+def element_internal_force_beam(E: float, I: float, L: float, ue4: np.ndarray) -> np.ndarray:
+    """Internal nodal force for EB 1D beam (linear): f_int = ke * ue.
+
+    ue4 must be length-4 in [w1, th1, w2, th2] order.
+    """
+    ue = np.asarray(ue4, dtype=float).ravel()
+    if ue.size != 4:
+        raise ValueError("element_internal_force_beam expects a vector of length 4")
+    ke = ke_beam(E, I, L)
+    return ke.dot(ue)
