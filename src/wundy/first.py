@@ -623,7 +623,11 @@ def apply_distributed_loads(
             elem_type = str(block.get("element", {}).get("type", "T1D1")).upper()
             # prepare q(x) evaluation: handle gravity and BX
             if dtype == "BX":
-                q_spec = dload["value"]
+                 # Support constant value, table interpolation, or expression.
+                if "table" in dload:
+                    raise ValueError("NO YET!")
+                elif "expression" in dload:
+                    dload["value"] = lambda x: eval(dload["expression"], {"sin": np.sin, "pi": np.pi, "x": x})
             elif dtype == "GRAV":
                 mat = materials[block["material"]]
                 rho = mat["density"]
@@ -745,7 +749,7 @@ def apply_distributed_loads(
                     x = N[0] * x1 + N[1] * x2
                     if dtype == "BX":
                         qx = (
-                            dload["value"](x)
+                            dload["value"](x) * sign
                             if callable(dload["value"])
                             else float(dload["value"]) * sign
                         )

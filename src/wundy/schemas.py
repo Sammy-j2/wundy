@@ -20,6 +20,8 @@ from schema import Or
 from schema import Schema
 from schema import Use
 
+import numpy as np
+
 NEUMANN = 0
 DIRICHLET = 1
 
@@ -173,7 +175,7 @@ nodes_schema = Schema(
         list,
         list_of_list,
         lambda outer: all(isinstance(inner[0], int) for inner in outer),  # node label
-        lambda outer: all(isinstance(f, (int, float)) for inner in outer for f in inner[1:]),
+        lambda outer: all(isinstance(f, (int, float, np.float64)) for inner in outer for f in inner[1:]),
         Use(lambda outer: [[int(inner[0]), *[float(_) for _ in inner[1:]]] for inner in outer]),
     )
 )
