@@ -827,7 +827,7 @@ def _shape_funcs(xi: float) -> np.ndarray:
     return np.array([N1, N2], dtype=float)
 
 
-def _gauss_1d(ngp: int):
+def _gauss_1d(ngp: int) -> tuple[np.ndarray, np.ndarray]:
     """Return Gauss-Legendre points and weights on [-1,1] for ngp=1..3."""
     if ngp == 1:
         return np.array([0.0], dtype=float), np.array([2.0], dtype=float)
@@ -1150,6 +1150,7 @@ def _neo_PK1_and_tangent(material: dict, F: float) -> tuple[float, float]:
         )
         
     # assert 0, "here I am"
+    
 
     # compute P and dP/dF
     lnF = float(np.log(F))

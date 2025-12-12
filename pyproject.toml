@@ -24,7 +24,7 @@ testpaths = [
     "tests",
 ]
 norecursedirs = "mock"
-addopts = "-ra --durations=10"
+addopts = "-ra --durations=10 -s"
 cache_dir = ".cache/pytest"
 python_files = "*.py"
 filterwarnings = [ "ignore::DeprecationWarning" ]

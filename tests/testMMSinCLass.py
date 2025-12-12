@@ -21,6 +21,9 @@ wundy:
   - name: fix-nodes
     dof: x
     nodes: [1]
+  - name: fix-right
+    dof: x
+    nodes: [51]
   
   materials:
   - type: elastic
@@ -41,7 +44,7 @@ wundy:
   - name: dload-1
     elements: all
     type: bx
-    expression: -pi**2*sin(pi * x)
+    expression: 10*pi**2*sin(pi * x)
     direction: [1]
 """.format(nodes=nodes, elements=elements.tolist(), q=q))
     file.seek(0)
@@ -61,7 +64,25 @@ wundy:
     F = soln["force"]
     R = np.dot(K, dofs) - F
     
-    assert np.allclose( R[0] , -q * L )
+    # For sinusoidal load with zero net integral, reaction forces should sum to zero
+    total_reaction = R[0] + R[-1]
+    assert np.allclose(total_reaction, 0.0, atol=1e-10)
+    
+    # Verify computed displacements match manufactured solution u = sin(pi*x)
+    u = dofs
+    ue = np.sin( np.pi * np.linspace(0,L,num_elems+1) )
+    norm = np.linalg.norm(ue-u)
+    print("Norm of error:", norm)
+    print(f"Computed u first 5: {u[:5]}")
+    print(f"Expected ue first 5: {ue[:5]}")
+    print(f"Computed u last 5: {u[-5:]}")
+    print(f"Expected ue last 5: {ue[-5:]}")
+    
+    # Check displacement error is small
+    assert np.allclose(u, ue, atol=1e-3, rtol=1e-2)
+    
+    
+ 
 
   
     
